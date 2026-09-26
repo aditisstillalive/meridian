@@ -11,6 +11,13 @@ import {
   sendAndConfirmTransaction,
   ComputeBudgetProgram,
 } from "@solana/web3.js";
+import {
+  sendAndConfirmSigned,
+  basePriorityPrice,
+  cappedPriorityPrice,
+  buildSenderTipIx,
+  heliusSenderEnabled,
+} from "./tx-send.js";
 import BN from "bn.js";
 import bs58 from "bs58";
 import { config, computeDeployAmount, MIN_SAFE_BINS_BELOW } from "../config.js";
@@ -27,7 +34,8 @@ import {
 } from "../state.js";
 import { recordPerformance } from "../lessons.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
-import { normalizeMint } from "./wallet.js";
+import { normalizeMint, getOnchainTokenBalance } from "./wallet.js";
+import { swapBackWithdrawnBase, expectedBaseWithdrawRaw, expectedClaimFeeRaw } from "./close-swap.js";
 import { appendDecision } from "../decision-log.js";
 import { agentMeridianJson, getAgentIdForRequests, getAgentMeridianHeaders } from "./agent-meridian.js";
 import { getAndClearStagedSignals } from "../signal-tracker.js";
@@ -101,105 +109,93 @@ function getWallet() {
 }
 
 /**
- * Send transaction with priority fee (compute budget) and retries.
- * Adds ComputeBudgetProgram.setComputeUnitPrice instruction and sets
- * lastValidBlockHeight for durability during congestion.
+ * Send transaction with dynamic priority fee, Helius Sender tip, dual-path
+ * broadcast (Sender + RPC), and rebroadcast until confirmed.
+ * Uses tx-send.js helpers so DLMM and swap paths land the same way.
  */
 async function sendWithPriorityFee(tx, signers, label = "tx") {
   const conn = getConnection();
   const wallet = signers.find((s) => s instanceof Keypair) || getWallet();
 
-  // Add priority fee instruction
-  const priorityFee = config.rpc?.priorityFeeMicrolamports ?? 50000;
-  const modifyTx = (tx) => {
-    if (tx instanceof Transaction) {
-      tx.add(
-        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee })
-      );
-    } else if (tx instanceof VersionedTransaction) {
-      const message = tx.message;
-      const newInstructions = [
-        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee }),
-        ...message.compiledInstructions.map((ix) => {
-          const keys = message.staticAccountKeys;
-          return new TransactionInstruction({
-            programId: keys[ix.programIdIndex],
-            keys: (ix.accountKeyIndexes || ix.accounts || [])
-              .map((idx) => ({ pubkey: keys[idx], isSigner: false, isWritable: false }))
-              .filter(Boolean),
-            data: Buffer.from(ix.data),
-          });
-        }),
-      ];
-      const newMessage = new TransactionMessage({
-        payerKey: message.staticAccountKeys[0],
-        recentBlockhash: message.recentBlockhash,
-        instructions: newInstructions,
-      }).compileToV0Message();
-      tx.message = newMessage;
-    }
-    return tx;
-  };
-
   // Get fresh blockhash with commitment for lastValidBlockHeight
   const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed");
 
-  let txToSend = modifyTx(tx);
-  if (txToSend instanceof Transaction) {
+  // Prepare transaction: add priority fee + sender tip, set feePayer/recentBlockhash
+  const sender = heliusSenderEnabled();
+  const estimatedCuPrice = config.rpc?.priorityFeeMicrolamports; // optional hint
+  const { microLamports: priorityFee } = basePriorityPrice(estimatedCuPrice);
+
+  // Build CU price instruction
+  const cuPriceIx = ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee });
+
+  // Build sender tip instruction (if enabled)
+  const tipIx = sender ? buildSenderTipIx(wallet.publicKey) : null;
+
+  // Modify transaction: add CU price + tip, update blockhash/feePayer
+  let txToSend;
+  if (tx instanceof Transaction) {
+    txToSend = tx;
+    txToSend.add(cuPriceIx);
+    if (tipIx) txToSend.add(tipIx);
     txToSend.recentBlockhash = blockhash;
     txToSend.feePayer = wallet.publicKey;
+  } else if (tx instanceof VersionedTransaction) {
+    const message = tx.message;
+    const newInstructions = [
+      cuPriceIx,
+      ...(tipIx ? [tipIx] : []),
+      ...message.compiledInstructions.map((ix) => {
+        const keys = message.staticAccountKeys;
+        return new TransactionInstruction({
+          programId: keys[ix.programIdIndex],
+          keys: (ix.accountKeyIndexes || ix.accounts || [])
+            .map((idx) => ({ pubkey: keys[idx], isSigner: false, isWritable: false }))
+            .filter(Boolean),
+          data: Buffer.from(ix.data),
+        });
+      }),
+    ];
+    const newMessage = new TransactionMessage({
+      payerKey: message.staticAccountKeys[0],
+      recentBlockhash: blockhash,
+      instructions: newInstructions,
+    }).compileToV0Message();
+    txToSend = tx;
+    txToSend.message = newMessage;
+  } else {
+    throw new Error(`Unsupported transaction type: ${tx.constructor.name}`);
   }
 
-  // Retry with exponential backoff
-  const maxRetries = 3;
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      const sig = await sendAndConfirmTransaction(
-        conn,
-        txToSend,
-        signers,
-        {
-          commitment: "confirmed",
-          skipPreflight: false,
-          maxRetries: 0,
-          lastValidBlockHeight: lastValidBlockHeight + 150,
-        }
-      );
-      log("tx", `${label} confirmed: ${sig} (attempt ${attempt}/${maxRetries}, priorityFee=${priorityFee} μL)`);
-      return sig;
-    } catch (e) {
-      const isLastAttempt = attempt === maxRetries;
-      log("tx_warn", `${label} attempt ${attempt}/${maxRetries} failed: ${e.message}${isLastAttempt ? "" : " — retrying"}`);
-      if (isLastAttempt) throw e;
-      // Refresh blockhash on retry
-      const { blockhash: newBlockhash, lastValidBlockHeight: newLvbh } = await conn.getLatestBlockhash("confirmed");
-      if (txToSend instanceof Transaction) {
-        txToSend.recentBlockhash = newBlockhash;
-      } else if (txToSend instanceof VersionedTransaction) {
-        const message = txToSend.message;
-        const newInstructions = [
-          ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee }),
-          ...message.compiledInstructions.map((ix) => {
-            const keys = message.staticAccountKeys;
-            return new TransactionInstruction({
-              programId: keys[ix.programIdIndex],
-              keys: (ix.accountKeyIndexes || ix.accounts || [])
-                .map((idx) => ({ pubkey: keys[idx], isSigner: false, isWritable: false }))
-                .filter(Boolean),
-              data: Buffer.from(ix.data),
-            });
-          }),
-        ];
-        const newMessage = new TransactionMessage({
-          payerKey: message.staticAccountKeys[0],
-          recentBlockhash: newBlockhash,
-          instructions: newInstructions,
-        }).compileToV0Message();
-        txToSend.message = newMessage;
-      }
-      await new Promise((r) => setTimeout(r, 1000 * attempt));
-    }
+  // Sign
+  txToSend.sign(signers);
+
+  // Serialize to wire format
+  const wire = Buffer.from(txToSend.serialize());
+  const signature = txToSend.signatures[0];
+
+  // Cap CU price so price × cuLimit <= maxPriorityFeeLamports
+  const cuLimit = 1_400_000; // MAX_CU_LIMIT
+  const { microLamports: cappedPrice, capped } = cappedPriorityPrice({ microLamports: priorityFee, cuLimit });
+  if (capped) {
+    log("tx_warn", `${label}: priority fee capped at ${cappedPrice} μL (max fee ${config.management.maxPriorityFeeLamports / 1_000_000} SOL)`);
   }
+
+  // Send via sendAndConfirmSigned (dual-path + rebroadcast)
+  log("tx", `${label} sending (priorityFee=${cappedPrice} μL, sender=${sender}, lastValidBlockHeight=${lastValidBlockHeight})`);
+  const confirmResult = await sendAndConfirmSigned(conn, {
+    wire,
+    signature,
+    blockhash,
+    lastValidBlockHeight,
+    label,
+    sender,
+  });
+
+  if (confirmResult?.err) {
+    throw new Error(`${label} failed on-chain: ${JSON.stringify(confirmResult.err)}`);
+  }
+  log("tx", `${label} confirmed: ${signature}`);
+  return signature;
 }
 
 function shouldUseLpAgentRelay() {
@@ -1573,6 +1569,12 @@ export async function claimFees({ position_address }) {
     const pool = await getPool(poolAddress);
 
     const positionData = await pool.getPosition(new PublicKey(position_address));
+    const baseMint = pool.lbPair.tokenXMint.toString();
+
+    // Capture pre-claim on-chain balance for delta-only swap-back
+    const preClaimRaw = (await getOnchainTokenBalance(baseMint))?.raw ?? null;
+    const expectedRaw = expectedClaimFeeRaw(pool, positionData, baseMint);
+
     const txs = await pool.claimSwapFee({
       owner: wallet.publicKey,
       position: positionData,
@@ -1591,7 +1593,30 @@ export async function claimFees({ position_address }) {
     _positionsCacheAt = 0; // invalidate cache after claim
     recordClaim(position_address);
 
-    return { success: true, position: position_address, txs: txHashes, base_mint: pool.lbPair.tokenXMint.toString() };
+    // Post-claim: swap withdrawn base token back to SOL (delta-only).
+    // Gated on autoSwapAfterClaim (same opt-in as the old whole-balance path).
+    let claimSwap = null;
+    let claimExposure = null;
+    if (config.management.autoSwapAfterClaim) {
+      const swapResult = await swapBackWithdrawnBase({
+        baseMint,
+        symbol: tracked?.pool_name || baseMint.slice(0, 8),
+        preRaw: preClaimRaw,
+        expectedRaw,
+      });
+      claimSwap = swapResult?.swapOutcome ?? null;
+      claimExposure = swapResult?.exposure ?? null;
+      if (swapResult?.txs?.length) txHashes.push(...swapResult.txs);
+    }
+
+    return {
+      success: true,
+      position: position_address,
+      txs: txHashes,
+      base_mint: baseMint,
+      claim_swap: claimSwap,
+      exposure: claimExposure,
+    };
   } catch (error) {
     log("claim_error", error.message);
     return { success: false, error: error.message };
@@ -1599,7 +1624,7 @@ export async function claimFees({ position_address }) {
 }
 
 // ─── Close Position ────────────────────────────────────────────
-export async function closePosition({ position_address, reason }) {
+export async function closePosition({ position_address, reason, skip_swap }) {
   position_address = normalizeMint(position_address);
   if (process.env.DRY_RUN === "true") {
     return { dry_run: true, would_close: position_address, message: "DRY RUN — no transaction sent" };
@@ -1871,6 +1896,12 @@ export async function closePosition({ position_address, reason }) {
     const claimTxHashes = [];
     const closeTxHashes = [];
 
+    // Capture pre-close on-chain balance for delta-only swap-back
+    const baseMint = pool.lbPair.tokenXMint.toString();
+    const positionDataForSwap = await pool.getPosition(positionPubKey);
+    const preCloseRaw = (await getOnchainTokenBalance(baseMint))?.raw ?? null;
+    const expectedRaw = expectedBaseWithdrawRaw(pool, positionDataForSwap, baseMint);
+
     // ─── Step 1: Claim Fees (to clear account state) ───────────
     const recentlyClaimed = tracked?.last_claim_at && (Date.now() - new Date(tracked.last_claim_at).getTime()) < 60_000;
     try {
@@ -2123,6 +2154,21 @@ export async function closePosition({ position_address, reason }) {
         },
       });
 
+      // Post-close: swap withdrawn base token back to SOL (delta-only)
+      let closeSwap = null;
+      let closeExposure = null;
+      if (!skip_swap) {
+        const swapResult = await swapBackWithdrawnBase({
+          baseMint: closeBaseMint,
+          symbol: tracked?.pool_name || closeBaseMint.slice(0, 8),
+          preRaw: preCloseRaw,
+          expectedRaw,
+        });
+        closeSwap = swapResult?.swapOutcome ?? null;
+        closeExposure = swapResult?.exposure ?? null;
+        txHashes.push(...(swapResult?.txs ?? []));
+      }
+
       return {
         success: true,
         position: position_address,
@@ -2134,6 +2180,8 @@ export async function closePosition({ position_address, reason }) {
         pnl_usd: pnlUsd,
         pnl_pct: pnlPct,
         base_mint: closeBaseMint,
+        close_swap: closeSwap,
+        exposure: closeExposure,
       };
     }
 
@@ -2148,6 +2196,21 @@ export async function closePosition({ position_address, reason }) {
       metrics: {},
     });
 
+    // Post-close: swap withdrawn base token back to SOL (delta-only)
+    let closeSwap = null;
+    let closeExposure = null;
+    if (!skip_swap) {
+      const swapResult = await swapBackWithdrawnBase({
+        baseMint: pool.lbPair.tokenXMint.toString(),
+        symbol: poolMeta?.name || pool.lbPair.tokenXMint.toString().slice(0, 8),
+        preRaw: preCloseRaw,
+        expectedRaw,
+      });
+      closeSwap = swapResult?.swapOutcome ?? null;
+      closeExposure = swapResult?.exposure ?? null;
+      txHashes.push(...(swapResult?.txs ?? []));
+    }
+
     return {
       success: true,
       position: position_address,
@@ -2157,6 +2220,8 @@ export async function closePosition({ position_address, reason }) {
       close_txs: closeTxHashes,
       txs: txHashes,
       base_mint: pool.lbPair.tokenXMint.toString(),
+      close_swap: closeSwap,
+      exposure: closeExposure,
     };
   } catch (error) {
     log("close_error", error.message);

@@ -68,6 +68,11 @@ export const config = {
   risk: {
     maxPositions:    u.maxPositions    ?? 3,
     maxDeployAmount: u.maxDeployAmount ?? 50,
+    // Price impact caps (percent) for Jupiter swaps.
+    // "default" = agent swap_token calls; "close" = post-close swap-back
+    // (leaving a withdrawn bag is worse than the slippage).
+    maxSwapPriceImpactPct:      u.maxSwapPriceImpactPct      ?? 5,
+    maxCloseSwapPriceImpactPct: u.maxCloseSwapPriceImpactPct ?? 25,
   },
 
   // ─── Pool Screening Thresholds ───────────
@@ -137,6 +142,15 @@ export const config = {
     pnlSanityMaxDiffPct:   u.pnlSanityMaxDiffPct   ?? 5,    // max allowed diff between reported and derived pnl % before ignoring a tick
     // SOL mode — positions, PnL, and balances reported in SOL instead of USD
     solMode:               u.solMode               ?? false,
+    // Helius Sender (0 credits, 50 tx/s, SWQoS routing)
+    heliusSender:          u.heliusSender          ?? true,
+    heliusSenderUrl:       u.heliusSenderUrl       ?? null,
+    heliusSenderTipLamports: u.heliusSenderTipLamports ?? 5000, // 0.000005 SOL
+    txRebroadcastMs:       u.txRebroadcastMs       ?? 2000,
+    // Priority fee pricing (micro-lamports per CU)
+    minPriorityFeeMicroLamports: u.minPriorityFeeMicroLamports ?? 50000,
+    fallbackPriorityFeeMicroLamports: u.fallbackPriorityFeeMicroLamports ?? 50000,
+    maxPriorityFeeLamports: u.maxPriorityFeeLamports ?? 1000000, // 0.001 SOL
   },
 
   // ─── Strategy Mapping ───────────────────

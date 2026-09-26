@@ -4,16 +4,29 @@ import {
   LAMPORTS_PER_SOL,
   VersionedTransaction,
   Keypair,
+  SystemProgram,
+  ComputeBudgetProgram,
 } from "@solana/web3.js";
 import bs58 from "bs58";
 import { log } from "../logger.js";
 import { config } from "../config.js";
+import { instrumentConnection, countRpc } from "./rpc-stats.js";
+import { getTokensInfo } from "./jup-tokens.js";
+import {
+  sendAndConfirmSigned,
+  basePriorityPrice,
+  cappedPriorityPrice,
+  buildSenderTipIx,
+} from "./tx-send.js";
 
 let _connection = null;
 let _wallet = null;
 
 function getConnection() {
-  if (!_connection) _connection = new Connection(process.env.RPC_URL, "confirmed");
+  if (!_connection) {
+    _connection = new Connection(process.env.RPC_URL, "confirmed");
+    instrumentConnection(_connection);
+  }
   return _connection;
 }
 
@@ -73,7 +86,7 @@ export async function getWalletBalances() {
   try {
     const url = `https://api.helius.xyz/v1/wallet/${walletAddress}/balances?api-key=${HELIUS_KEY}`;
     const res = await fetch(url);
-    
+
     if (!res.ok) {
       throw new Error(`Helius API error: ${res.status} ${res.statusText}`);
     }
@@ -123,18 +136,77 @@ export async function getWalletBalances() {
 }
 
 /**
+ * On-chain balance of one mint for the wallet, read straight from RPC at
+ * `confirmed` (not the Helius indexed balances API, which lags behind txs that
+ * just confirmed). Sums every token account the owner holds for the mint. The
+ * `mint` filter makes the RPC resolve the mint's own program, so Token and
+ * Token-2022 accounts are both covered.
+ *
+ * Returns { raw: bigint, decimals: number|null, accounts }. decimals is null
+ * only when the owner has no account for the mint (raw is then 0n). Throws when
+ * the read fails or an account is unparseable, so callers can treat the balance
+ * as unknown instead of zero.
+ *
+ * @param {string} mint
+ * @param {object} [deps] Test seam only: { connection, owner }.
+ */
+export async function getOnchainTokenBalance(mint, deps = {}) {
+  const connection = deps.connection ?? getConnection();
+  const owner = deps.owner ?? getWallet().publicKey;
+  const res = await connection.getParsedTokenAccountsByOwner(
+    owner,
+    { mint: new PublicKey(mint) },
+    { commitment: "confirmed" },
+  );
+  if (!res || !Array.isArray(res.value)) throw new Error(`getParsedTokenAccountsByOwner returned no value for ${mint}`);
+  let raw = 0n;
+  let decimals = null;
+  for (const { account } of res.value) {
+    const amt = account?.data?.parsed?.info?.tokenAmount;
+    if (amt?.amount == null || !/^\d+$/.test(String(amt.amount))) {
+      throw new Error(`Unparseable token account for ${mint}`);
+    }
+    raw += BigInt(amt.amount);
+    if (decimals == null && Number.isInteger(amt.decimals)) decimals = amt.decimals;
+  }
+  return { raw, decimals, accounts: res.value.length };
+}
+
+/**
+ * Get token USD price from Jupiter Price API V3.
+ * Returns price in USD or null if not available.
+ */
+export async function getTokenUsdPrice(mint) {
+  try {
+    const url = `${JUPITER_PRICE_API}?ids=${encodeURIComponent(mint)}&vsToken=${encodeURIComponent(config.tokens.USDC)}`;
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const price = data?.data?.[mint]?.price;
+    return price != null ? Number(price) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Swap tokens via Jupiter Swap API V2 (order → sign → execute).
  */
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 
 // Normalize any SOL-like address to the correct wrapped SOL mint
+// Re-export for dlmm.js and close-swap.js
+export { getTokensInfo } from "./jup-tokens.js";
+export { instrumentConnection, countRpc } from "./rpc-stats.js";
+export { sendAndConfirmSigned, basePriorityPrice, cappedPriorityPrice, buildSenderTipIx } from "./tx-send.js";
+
 export function normalizeMint(mint) {
   if (!mint) return mint;
   const SOL_MINT = "So11111111111111111111111111111111111111112";
   if (
-    mint === "SOL" || 
-    mint === "native" || 
-    /^So1+$/.test(mint) || 
+    mint === "SOL" ||
+    mint === "native" ||
+    /^So1+$/.test(mint) ||
     (mint.length >= 32 && mint.length <= 44 && mint.startsWith("So1") && mint !== SOL_MINT)
   ) {
     return SOL_MINT;
@@ -142,11 +214,63 @@ export function normalizeMint(mint) {
   return mint;
 }
 
+export const DEFAULT_MAX_SWAP_PRICE_IMPACT_PCT = 5;
+export const DEFAULT_MAX_CLOSE_SWAP_PRICE_IMPACT_PCT = 25;
+
+/**
+ * Price impact of a Swap v2 /order response, in percent (0.12 = 0.12%).
+ * Prefers `priceImpact` (number, already percent); falls back to the deprecated
+ * `priceImpactPct` (string decimal fraction, e.g. "-0.0012") × 100.
+ */
+export function parsePriceImpactPercent(order) {
+  const direct = order?.priceImpact;
+  if (direct != null && direct !== "" && Number.isFinite(Number(direct))) return Number(direct);
+  const frac = order?.priceImpactPct;
+  if (frac != null && frac !== "" && Number.isFinite(Number(frac))) return Number(frac) * 100;
+  return null;
+}
+
+const IMPACT_CAPS = {
+  default: { key: "maxSwapPriceImpactPct", fallback: DEFAULT_MAX_SWAP_PRICE_IMPACT_PCT },
+  close: { key: "maxCloseSwapPriceImpactPct", fallback: DEFAULT_MAX_CLOSE_SWAP_PRICE_IMPACT_PCT },
+};
+
+/** Effective cap for `kind` from config.risk, or its default when unset/invalid. */
+export function priceImpactCap(kind = "default") {
+  const c = IMPACT_CAPS[kind] ?? IMPACT_CAPS.default;
+  const v = Number(config.risk?.[c.key]);
+  return { key: c.key, cap: Number.isFinite(v) && v > 0 ? v : c.fallback };
+}
+
+/**
+ * Refusal result when |impactPct| exceeds the cap of `kind`, else null. An
+ * unknown impact (null) is allowed — the field is undocumented on Swap v2, and
+ * blocking every swap if Jupiter dropped it would strand exits.
+ */
+export function checkPriceImpact(impactPct, { input_mint, output_mint, kind = "default" } = {}) {
+  const { key, cap } = priceImpactCap(kind);
+  if (impactPct == null) return null;
+  const abs = Math.abs(impactPct);
+  if (abs <= cap) return null;
+  const error = `Swap refused: price impact ${abs.toFixed(2)}% exceeds ${key} ${cap}%`;
+  log("swap", `${error} (${input_mint} → ${output_mint})`);
+  return {
+    success: false,
+    price_impact_refused: true,
+    price_impact_pct: Math.round(abs * 100) / 100,
+    max_price_impact_pct: cap,
+    price_impact_cap_key: key,
+    input_mint,
+    output_mint,
+    error,
+  };
+}
+
 export async function swapToken({
   input_mint,
   output_mint,
   amount,
-}) {
+}, opts = {}) {
   input_mint  = normalizeMint(input_mint);
   output_mint = normalizeMint(output_mint);
 
@@ -198,6 +322,11 @@ export async function swapToken({
     if (order.errorCode || order.errorMessage) {
       throw new Error(`Swap V2 order error: ${order.errorMessage || order.errorCode}`);
     }
+
+    // Nothing signed yet — refuse on excessive price impact before building the tx.
+    const impact = parsePriceImpactPercent(order);
+    const impactRefusal = checkPriceImpact(impact, { input_mint, output_mint, kind: opts.impactCap });
+    if (impactRefusal) return impactRefusal;
 
     const { transaction: unsignedTx, requestId } = order;
 

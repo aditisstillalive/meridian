@@ -598,61 +598,6 @@ const PROTECTED_TOOLS = new Set([
   "self_update",
 ]);
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-/**
- * Swap a base token back to SOL with retry. Jupiter can transiently fail (no route,
- * quote error) and a single attempt silently leaves the token unsold — this retries
- * with a delay, re-fetching the balance each attempt (amounts can shift on partial
- * fills). Treats both a throw AND result.success===false / missing tx as failure.
- * Returns { swapped, result, token } — swapped=false if nothing to do or all attempts failed.
- */
-async function swapBaseToSolWithRetry(baseMint, label) {
-  const attempts = Math.max(1, Number(config.management.autoSwapRetryAttempts ?? 3));
-  const delayMs = Math.max(0, Number(config.management.autoSwapRetryDelayMs ?? 3000));
-  let lastErr = null;
-
-  // Wait for token to land in wallet (withdrawal settles + Helius indexes)
-  const settleDelayMs = Math.max(0, Number(config.management.autoSwapSettleDelayMs ?? 8000));
-  if (settleDelayMs > 0) {
-    log("executor", `Auto-swap ${label}: waiting ${settleDelayMs}ms for token settlement...`);
-    await sleep(settleDelayMs);
-  }
-
-  let hadBalance = false;
-  for (let attempt = 1; attempt <= attempts; attempt++) {
-    try {
-      const balances = await getWalletBalances({});
-      const token = balances.tokens?.find((t) => t.mint === baseMint);
-      // Check balance > 0 (not USD) — Helius may not price low-cap tokens
-      if (!token || token.balance <= 0) {
-        if (!hadBalance) {
-          // No balance on first check (after settle) = already swapped or never received
-          log("executor", `Auto-swap ${label}: no ${baseMint.slice(0, 8)} balance — already swapped or never received, skipping`);
-          return { swapped: false, result: null, token: null };
-        }
-        // Had balance before but now gone = partial fill, retry
-        log("executor_warn", `Auto-swap ${label}: ${baseMint.slice(0, 8)} balance disappeared (attempt ${attempt}/${attempts}) — retrying`);
-        if (attempt < attempts) await sleep(delayMs);
-        continue;
-      }
-      hadBalance = true;
-      const usdStr = token.usd != null ? `$${token.usd.toFixed(2)}` : "(no USD price)";
-      log("executor", `Auto-swapping ${label} ${token.symbol || baseMint.slice(0, 8)} ${usdStr} back to SOL (attempt ${attempt}/${attempts})`);
-      const swapResult = await swapToken({ input_mint: baseMint, output_mint: "SOL", amount: token.balance });
-      const ok = swapResult && swapResult.success !== false && !swapResult.error && (swapResult.tx || swapResult.amount_out);
-      if (ok) return { swapped: true, result: swapResult, token };
-      lastErr = swapResult?.error || swapResult?.reason || "swap returned no tx";
-    } catch (e) {
-      lastErr = e.message;
-    }
-    log("executor_warn", `Auto-swap ${label} attempt ${attempt}/${attempts} failed: ${lastErr}`);
-    if (attempt < attempts) await sleep(delayMs);
-  }
-  log("executor_warn", `Auto-swap ${label} failed after ${attempts} attempts — base token left unsold (${baseMint.slice(0, 8)})`);
-  return { swapped: false, result: null, token: null };
-}
-
 /**
  * Execute a tool call with safety checks and logging.
  */
@@ -708,18 +653,14 @@ export async function executeTool(name, args) {
           const poolAddr = result.pool || args.pool_address;
           if (poolAddr) addPoolNote({ pool_address: poolAddr, note: `Closed: low yield (fee/TVL below threshold) at ${new Date().toISOString().slice(0,10)}` }).catch?.(() => {});
         }
-        // Auto-swap base token back to SOL unless user said to hold (retried).
-        if (!args.skip_swap && result.base_mint) {
-          const { swapped, result: swapResult } = await swapBaseToSolWithRetry(result.base_mint, "after close");
-          if (swapped) {
-            // Tell the model the swap already happened so it doesn't call swap_token again
-            result.auto_swapped = true;
-            result.auto_swap_note = `Base token already auto-swapped back to SOL (${result.base_mint.slice(0, 8)} → SOL). Do NOT call swap_token again.`;
-            if (swapResult?.amount_out) result.sol_received = swapResult.amount_out;
-          }
+        // Auto-swap happened inside closePosition (delta-only, on-chain balance).
+        // Signal the model so it doesn't call swap_token again.
+        if (!args.skip_swap && result.base_mint && result.close_swap?.success) {
+          result.auto_swapped = true;
+          result.auto_swap_note = `Base token already auto-swapped back to SOL (${result.base_mint.slice(0, 8)} → SOL). Do NOT call swap_token again.`;
+        } else if (!args.skip_swap && result.exposure) {
+          result.auto_swap_note = `Post-close swap left unsold ${result.base_mint?.slice(0, 8)} exposure in wallet — swap manually or via swap_token.`;
         }
-      } else if (name === "claim_fees" && config.management.autoSwapAfterClaim && result.base_mint) {
-        await swapBaseToSolWithRetry(result.base_mint, "after claim");
       }
     }
 
