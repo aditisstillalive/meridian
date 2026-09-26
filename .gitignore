@@ -52,3 +52,4 @@ helius_api_key.txt
 user-config.json
 lessons.json
 .mcp.json
+scripts/replace-helius-key.*
