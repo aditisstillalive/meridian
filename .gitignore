@@ -47,3 +47,8 @@ discord-signals.json
 
 # Claude Code runtime lock
 .claude/scheduled_tasks.lock
+helius_api_key.txt
+.env
+user-config.json
+lessons.json
+.mcp.json

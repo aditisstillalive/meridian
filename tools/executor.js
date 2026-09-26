@@ -366,6 +366,8 @@ const toolMap = {
       maxBotHoldersPct: ["screening", "maxBotHoldersPct"],
       maxTop10Pct: ["screening", "maxTop10Pct"],
       allowedLaunchpads: ["screening", "allowedLaunchpads"],
+      volumeTrendEnabled: ["screening", "volumeTrendEnabled"],
+      volumeTrendDecelerating: ["screening", "volumeTrendDecelerating"],
       blockedLaunchpads: ["screening", "blockedLaunchpads"],
       minTokenAgeHours: ["screening", "minTokenAgeHours"],
       maxTokenAgeHours: ["screening", "maxTokenAgeHours"],
@@ -378,6 +380,7 @@ const toolMap = {
       autoSwapRetryDelayMs: ["management", "autoSwapRetryDelayMs"],
       outOfRangeBinsToClose: ["management", "outOfRangeBinsToClose"],
       outOfRangeWaitMinutes: ["management", "outOfRangeWaitMinutes"],
+      oorProfitHoldThreshold: ["management", "oorProfitHoldThreshold"],
       oorCooldownTriggerCount: ["management", "oorCooldownTriggerCount"],
       oorCooldownHours: ["management", "oorCooldownHours"],
       repeatDeployCooldownEnabled: ["management", "repeatDeployCooldownEnabled"],
@@ -608,15 +611,34 @@ async function swapBaseToSolWithRetry(baseMint, label) {
   const attempts = Math.max(1, Number(config.management.autoSwapRetryAttempts ?? 3));
   const delayMs = Math.max(0, Number(config.management.autoSwapRetryDelayMs ?? 3000));
   let lastErr = null;
+
+  // Wait for token to land in wallet (withdrawal settles + Helius indexes)
+  const settleDelayMs = Math.max(0, Number(config.management.autoSwapSettleDelayMs ?? 8000));
+  if (settleDelayMs > 0) {
+    log("executor", `Auto-swap ${label}: waiting ${settleDelayMs}ms for token settlement...`);
+    await sleep(settleDelayMs);
+  }
+
+  let hadBalance = false;
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
       const balances = await getWalletBalances({});
       const token = balances.tokens?.find((t) => t.mint === baseMint);
-      if (!token || token.usd < 0.10) {
-        // Nothing left to swap (already sold or dust) — treat as done.
-        return { swapped: attempt > 1, result: null, token: null };
+      // Check balance > 0 (not USD) — Helius may not price low-cap tokens
+      if (!token || token.balance <= 0) {
+        if (!hadBalance) {
+          // No balance on first check (after settle) = already swapped or never received
+          log("executor", `Auto-swap ${label}: no ${baseMint.slice(0, 8)} balance — already swapped or never received, skipping`);
+          return { swapped: false, result: null, token: null };
+        }
+        // Had balance before but now gone = partial fill, retry
+        log("executor_warn", `Auto-swap ${label}: ${baseMint.slice(0, 8)} balance disappeared (attempt ${attempt}/${attempts}) — retrying`);
+        if (attempt < attempts) await sleep(delayMs);
+        continue;
       }
-      log("executor", `Auto-swapping ${label} ${token.symbol || baseMint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL (attempt ${attempt}/${attempts})`);
+      hadBalance = true;
+      const usdStr = token.usd != null ? `$${token.usd.toFixed(2)}` : "(no USD price)";
+      log("executor", `Auto-swapping ${label} ${token.symbol || baseMint.slice(0, 8)} ${usdStr} back to SOL (attempt ${attempt}/${attempts})`);
       const swapResult = await swapToken({ input_mint: baseMint, output_mint: "SOL", amount: token.balance });
       const ok = swapResult && swapResult.success !== false && !swapResult.error && (swapResult.tx || swapResult.amount_out);
       if (ok) return { swapped: true, result: swapResult, token };

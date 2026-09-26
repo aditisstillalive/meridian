@@ -384,6 +384,19 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
 
   if (changed) save(state);
 
+  // ── Breakeven floor ────────────────────────────────────────────
+  // Once trailing TP is armed, a fast dump must not be allowed to run the
+  // position into a loss. Close immediately (skip N-tick confirmation) the
+  // moment PnL touches 0% — the Plumber case peaked +1.61% and closed -1.29%
+  // because confirm + tx latency outran the trailing stop.
+  if (!pnl_pct_suspicious && pos.trailing_active && currentPnlPct != null && currentPnlPct <= 0) {
+    return {
+      action: "BREAKEVEN_FLOOR",
+      reason: `Breakeven floor: trailing armed, PnL ${currentPnlPct.toFixed(2)}% <= 0% (peak ${pos.peak_pnl_pct.toFixed(2)}%)`,
+      immediate: true,
+    };
+  }
+
   // ── Stop loss ──────────────────────────────────────────────────
   if (!pnl_pct_suspicious && currentPnlPct != null && mgmtConfig.stopLossPct != null && currentPnlPct <= mgmtConfig.stopLossPct) {
     return {
@@ -400,6 +413,7 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
         action: "TRAILING_TP",
         reason: `Trailing TP: peak ${pos.peak_pnl_pct.toFixed(2)}% → current ${currentPnlPct.toFixed(2)}% (dropped ${dropFromPeak.toFixed(2)}% >= ${mgmtConfig.trailingDropPct}%)`,
         needs_confirmation: true,
+        immediate: dropFromPeak >= mgmtConfig.trailingDropPct * 2,
         peak_pnl_pct: pos.peak_pnl_pct,
         current_pnl_pct: currentPnlPct,
         drop_from_peak_pct: dropFromPeak,
@@ -411,10 +425,16 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   if (pos.out_of_range_since) {
     const minutesOOR = Math.floor((Date.now() - new Date(pos.out_of_range_since).getTime()) / 60000);
     if (minutesOOR >= mgmtConfig.outOfRangeWaitMinutes) {
-      return {
-        action: "OUT_OF_RANGE",
-        reason: `Out of range for ${minutesOOR}m (limit: ${mgmtConfig.outOfRangeWaitMinutes}m)`,
-      };
+      // Hold OOR position if PnL is above configurable profit threshold
+      const oorProfitHoldThreshold = mgmtConfig.oorProfitHoldThreshold ?? 1;
+      if (oorProfitHoldThreshold > 0 && currentPnlPct != null && currentPnlPct >= oorProfitHoldThreshold) {
+        log("state", `Position ${position_address} OOR for ${minutesOOR}m but PnL ${currentPnlPct.toFixed(2)}% >= ${oorProfitHoldThreshold}% threshold — holding`);
+      } else {
+        return {
+          action: "OUT_OF_RANGE",
+          reason: `Out of range for ${minutesOOR}m (limit: ${mgmtConfig.outOfRangeWaitMinutes}m)`,
+        };
+      }
     }
   }
 

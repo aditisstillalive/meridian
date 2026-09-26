@@ -737,15 +737,24 @@ Summarize the current portfolio health, total fees earned, and performance of al
         // Detect an exit signal this tick (rule-based exits, then deterministic close rules).
         const exit = updatePnlAndCheckExits(p.position, p, config.management);
         const closeRule = exit ? null : getDeterministicCloseRule(p, config.management);
-        let signal = null, reason = null, rule = "exit";
-        if (exit) { signal = exit.action; reason = exit.reason; }
+        let signal = null, reason = null, rule = "exit", immediate = false;
+        if (exit) { signal = exit.action; reason = exit.reason; immediate = !!exit.immediate; }
         else if (closeRule) { signal = `RULE_${closeRule.rule}`; reason = closeRule.reason; rule = closeRule.rule; }
 
-        // Require N consecutive confirming ticks before acting.
-        const { fire } = registerExitSignal(p.position, signal, confirmTicks);
+        // Require N consecutive confirming ticks before acting — unless this is an
+        // immediate signal (fast dump or breakeven floor), which closes this tick.
+        let fire = false;
+        if (signal) {
+          if (immediate) {
+            registerExitSignal(p.position, null, confirmTicks); // clear any pending streak
+            fire = true;
+          } else {
+            ({ fire } = registerExitSignal(p.position, signal, confirmTicks));
+          }
+        }
         if (!signal || !fire) continue;
 
-        log("state", `[PnL poll] ${signal} confirmed (${confirmTicks} ticks): ${p.pair} — ${reason} — closing directly`);
+        log("state", `[PnL poll] ${signal} ${immediate ? "immediate" : `confirmed (${confirmTicks} ticks)`}: ${p.pair} — ${reason} — closing directly`);
         // Hold the management lock so the cron cycle can't double-act on this position.
         _managementBusy = true;
         try {

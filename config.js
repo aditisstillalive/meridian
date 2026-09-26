@@ -98,6 +98,11 @@ export const config = {
     blockedLaunchpads:  u.blockedLaunchpads  ?? [],  // e.g. ["letsbonk.fun", "pump.fun"]
     minTokenAgeHours:   u.minTokenAgeHours   ?? null, // null = no minimum
     maxTokenAgeHours:   u.maxTokenAgeHours   ?? null, // null = no maximum
+    // Volume trend filter: reject pools with decelerating volume.
+    // Decelerating volume is the only signal containing ALL catastrophic losses
+    // in historical data (avg PnL: accelerating +0.21%, stable +0.42%, decelerating -0.23%).
+    volumeTrendEnabled: u.volumeTrendEnabled ?? true,
+    volumeTrendDecelerating: u.volumeTrendDecelerating ?? -15, // pct threshold; below = decelerating
   },
 
   // ─── Position Management ────────────────
@@ -108,6 +113,7 @@ export const config = {
     autoSwapRetryDelayMs:  u.autoSwapRetryDelayMs  ?? 3000, // delay between auto-swap retries
     outOfRangeBinsToClose: u.outOfRangeBinsToClose ?? 10,
     outOfRangeWaitMinutes: u.outOfRangeWaitMinutes ?? 30,
+    oorProfitHoldThreshold: u.oorProfitHoldThreshold ?? 1, // hold OOR positions above this PnL % (0 to disable)
     oorCooldownTriggerCount: u.oorCooldownTriggerCount ?? 3,
     oorCooldownHours:       u.oorCooldownHours       ?? 12,
     repeatDeployCooldownEnabled: u.repeatDeployCooldownEnabled ?? true,
@@ -146,6 +152,11 @@ export const config = {
     managementIntervalMin:  u.managementIntervalMin  ?? 10,
     screeningIntervalMin:   u.screeningIntervalMin   ?? 30,
     healthCheckIntervalMin: u.healthCheckIntervalMin ?? 60,
+  },
+
+  // ─── RPC / Priority Fee ──────────────────
+  rpc: {
+    priorityFeeMicrolamports: u.priorityFeeMicrolamports ?? 50000, // 0.00005 SOL default
   },
 
   // ─── LLM Settings ──────────────────────
@@ -322,6 +333,8 @@ export function reloadScreeningThresholds() {
     if (fresh.maxBotHoldersPct  != null) s.maxBotHoldersPct = fresh.maxBotHoldersPct;
     if (fresh.allowedLaunchpads !== undefined) s.allowedLaunchpads = fresh.allowedLaunchpads;
     if (fresh.blockedLaunchpads !== undefined) s.blockedLaunchpads = fresh.blockedLaunchpads;
+    if (fresh.volumeTrendEnabled !== undefined) s.volumeTrendEnabled = fresh.volumeTrendEnabled;
+    if (fresh.volumeTrendDecelerating != null) s.volumeTrendDecelerating = fresh.volumeTrendDecelerating;
     const minBinsBelow = numericConfig(fresh.minBinsBelow) ?? config.strategy.minBinsBelow;
     const maxBinsBelow = numericConfig(fresh.maxBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.maxBinsBelow;
     const defaultBinsBelow = numericConfig(fresh.defaultBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.defaultBinsBelow ?? maxBinsBelow;

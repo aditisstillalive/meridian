@@ -6,8 +6,10 @@ import {
   SystemProgram,
   Transaction,
   TransactionInstruction,
+  TransactionMessage,
   VersionedTransaction,
   sendAndConfirmTransaction,
+  ComputeBudgetProgram,
 } from "@solana/web3.js";
 import BN from "bn.js";
 import bs58 from "bs58";
@@ -96,6 +98,108 @@ function getWallet() {
     log("init", `Wallet: ${_wallet.publicKey.toString()}`);
   }
   return _wallet;
+}
+
+/**
+ * Send transaction with priority fee (compute budget) and retries.
+ * Adds ComputeBudgetProgram.setComputeUnitPrice instruction and sets
+ * lastValidBlockHeight for durability during congestion.
+ */
+async function sendWithPriorityFee(tx, signers, label = "tx") {
+  const conn = getConnection();
+  const wallet = signers.find((s) => s instanceof Keypair) || getWallet();
+
+  // Add priority fee instruction
+  const priorityFee = config.rpc?.priorityFeeMicrolamports ?? 50000;
+  const modifyTx = (tx) => {
+    if (tx instanceof Transaction) {
+      tx.add(
+        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee })
+      );
+    } else if (tx instanceof VersionedTransaction) {
+      const message = tx.message;
+      const newInstructions = [
+        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee }),
+        ...message.compiledInstructions.map((ix) => {
+          const keys = message.staticAccountKeys;
+          return new TransactionInstruction({
+            programId: keys[ix.programIdIndex],
+            keys: (ix.accountKeyIndexes || ix.accounts || [])
+              .map((idx) => ({ pubkey: keys[idx], isSigner: false, isWritable: false }))
+              .filter(Boolean),
+            data: Buffer.from(ix.data),
+          });
+        }),
+      ];
+      const newMessage = new TransactionMessage({
+        payerKey: message.staticAccountKeys[0],
+        recentBlockhash: message.recentBlockhash,
+        instructions: newInstructions,
+      }).compileToV0Message();
+      tx.message = newMessage;
+    }
+    return tx;
+  };
+
+  // Get fresh blockhash with commitment for lastValidBlockHeight
+  const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed");
+
+  let txToSend = modifyTx(tx);
+  if (txToSend instanceof Transaction) {
+    txToSend.recentBlockhash = blockhash;
+    txToSend.feePayer = wallet.publicKey;
+  }
+
+  // Retry with exponential backoff
+  const maxRetries = 3;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const sig = await sendAndConfirmTransaction(
+        conn,
+        txToSend,
+        signers,
+        {
+          commitment: "confirmed",
+          skipPreflight: false,
+          maxRetries: 0,
+          lastValidBlockHeight: lastValidBlockHeight + 150,
+        }
+      );
+      log("tx", `${label} confirmed: ${sig} (attempt ${attempt}/${maxRetries}, priorityFee=${priorityFee} μL)`);
+      return sig;
+    } catch (e) {
+      const isLastAttempt = attempt === maxRetries;
+      log("tx_warn", `${label} attempt ${attempt}/${maxRetries} failed: ${e.message}${isLastAttempt ? "" : " — retrying"}`);
+      if (isLastAttempt) throw e;
+      // Refresh blockhash on retry
+      const { blockhash: newBlockhash, lastValidBlockHeight: newLvbh } = await conn.getLatestBlockhash("confirmed");
+      if (txToSend instanceof Transaction) {
+        txToSend.recentBlockhash = newBlockhash;
+      } else if (txToSend instanceof VersionedTransaction) {
+        const message = txToSend.message;
+        const newInstructions = [
+          ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee }),
+          ...message.compiledInstructions.map((ix) => {
+            const keys = message.staticAccountKeys;
+            return new TransactionInstruction({
+              programId: keys[ix.programIdIndex],
+              keys: (ix.accountKeyIndexes || ix.accounts || [])
+                .map((idx) => ({ pubkey: keys[idx], isSigner: false, isWritable: false }))
+                .filter(Boolean),
+              data: Buffer.from(ix.data),
+            });
+          }),
+        ];
+        const newMessage = new TransactionMessage({
+          payerKey: message.staticAccountKeys[0],
+          recentBlockhash: newBlockhash,
+          instructions: newInstructions,
+        }).compileToV0Message();
+        txToSend.message = newMessage;
+      }
+      await new Promise((r) => setTimeout(r, 1000 * attempt));
+    }
+  }
 }
 
 function shouldUseLpAgentRelay() {
@@ -795,7 +899,7 @@ export async function deployPosition({
       const createTxArray = Array.isArray(createTxs) ? createTxs : [createTxs];
       for (let i = 0; i < createTxArray.length; i++) {
         const signers = i === 0 ? [wallet, newPosition] : [wallet];
-        const txHash = await sendAndConfirmTransaction(getConnection(), createTxArray[i], signers);
+        const txHash = await sendWithPriorityFee(createTxArray[i], signers, `deploy-create-${i + 1}`);
         txHashes.push(txHash);
         log("deploy", `Create tx ${i + 1}/${createTxArray.length}: ${txHash}`);
       }
@@ -811,7 +915,7 @@ export async function deployPosition({
       });
       const addTxArray = Array.isArray(addTxs) ? addTxs : [addTxs];
       for (let i = 0; i < addTxArray.length; i++) {
-        const txHash = await sendAndConfirmTransaction(getConnection(), addTxArray[i], [wallet]);
+        const txHash = await sendWithPriorityFee(addTxArray[i], [wallet], `deploy-addliq-${i + 1}`);
         txHashes.push(txHash);
         log("deploy", `Add liquidity tx ${i + 1}/${addTxArray.length}: ${txHash}`);
       }
@@ -825,7 +929,7 @@ export async function deployPosition({
         strategy: { maxBinId, minBinId, strategyType },
         slippage: 1000, // 10% in bps
       });
-      const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet, newPosition]);
+      const txHash = await sendWithPriorityFee(tx, [wallet, newPosition], "deploy-standard");
       txHashes.push(txHash);
     }
 
@@ -1480,7 +1584,7 @@ export async function claimFees({ position_address }) {
 
     const txHashes = [];
     for (const tx of txs) {
-      const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet]);
+      const txHash = await sendWithPriorityFee(tx, [wallet], "claim-fees");
       txHashes.push(txHash);
     }
     log("claim", `SUCCESS txs: ${txHashes.join(", ")}`);
@@ -1781,7 +1885,7 @@ export async function closePosition({ position_address, reason }) {
         });
         if (claimTxs && claimTxs.length > 0) {
           for (const tx of claimTxs) {
-            const claimHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet]);
+            const claimHash = await sendWithPriorityFee(tx, [wallet], "close-claim");
             claimTxHashes.push(claimHash);
           }
           log("close", `Step 1 OK (claim only): ${claimTxHashes.join(", ")}`);
@@ -1820,7 +1924,7 @@ export async function closePosition({ position_address, reason }) {
       });
 
       for (const tx of Array.isArray(closeTx) ? closeTx : [closeTx]) {
-        const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet]);
+        const txHash = await sendWithPriorityFee(tx, [wallet], "close-removeliquidity");
         closeTxHashes.push(txHash);
       }
     } else {
@@ -1829,7 +1933,7 @@ export async function closePosition({ position_address, reason }) {
         owner: wallet.publicKey,
         position: { publicKey: positionPubKey },
       });
-      const txHash = await sendAndConfirmTransaction(getConnection(), closeTx, [wallet]);
+      const txHash = await sendWithPriorityFee(closeTx, [wallet], "close-account");
       closeTxHashes.push(txHash);
     }
     const txHashes = [...claimTxHashes, ...closeTxHashes];
