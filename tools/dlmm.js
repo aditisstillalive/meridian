@@ -600,6 +600,12 @@ export async function deployPosition({
   const actualBinStep = pool.lbPair.binStep;
   const activePrice = Number(getPriceOfBinByBinId(activeBin.binId, actualBinStep).toString());
 
+  // Validate active bin ID — negative bin IDs indicate an uninitialized or
+  // corrupted pool state that will cause SDK instruction errors downstream.
+  if (activeBin.binId < 0) {
+    throw new Error(`Invalid active bin ID: ${activeBin.binId}. Pool may be uninitialized or in an invalid state.`);
+  }
+
   if (downside_pct != null || upside_pct != null) {
     const downsidePct = Math.max(0, Number(downside_pct ?? 0));
     const upsidePct = Math.max(0, Number(upside_pct ?? 0));
@@ -698,6 +704,9 @@ export async function deployPosition({
   const minBinId = activeBin.binId - activeBinsBelow;
   const maxBinId = isSingleSidedSol ? activeBin.binId : activeBin.binId + activeBinsAbove;
 
+  if (minBinId < 0 || maxBinId < 0) {
+    throw new Error(`Invalid bin range: ${minBinId} -> ${maxBinId}. Bin IDs must be non-negative.`);
+  }
   if (minBinId > maxBinId) {
     throw new Error(`Invalid bin range: ${minBinId} -> ${maxBinId}`);
   }
