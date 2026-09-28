@@ -249,3 +249,47 @@ export async function swapToken({
     return { success: false, error: error.message };
   }
 }
+
+/**
+ * Get the on-chain token balance for a mint using RPC (not Helius API).
+ * Returns { raw: bigint, decimals: number, ui: string }.
+ * This is used for close-swap delta computation — reads the token account
+ * directly so there's no indexing lag.
+ */
+export async function getOnchainTokenBalance(mint) {
+  const connection = getConnection();
+  const wallet = getWallet();
+  const tokenAccounts = await connection.getTokenAccountsByOwner(wallet.publicKey, {
+    mint: new PublicKey(mint),
+  });
+  if (tokenAccounts.value.length === 0) {
+    return { raw: 0n, decimals: 0, ui: "0" };
+  }
+  // Use the first token account (should only be one per mint)
+  const accountInfo = await connection.getParsedAccountInfo(tokenAccounts.value[0].pubkey);
+  const data = accountInfo.value?.data?.parsed?.info;
+  if (!data) return { raw: 0n, decimals: 0, ui: "0" };
+  const decimals = data.tokenAmount.decimals ?? 0;
+  const raw = BigInt(data.tokenAmount.amount || "0");
+  const ui = decimals > 0
+    ? (raw / 10n ** BigInt(decimals)).toString()
+    : raw.toString();
+  return { raw, decimals, ui };
+}
+
+/**
+ * Get USD price for a token mint using Jupiter Price API.
+ */
+export async function getTokenUsdPrice(mint) {
+  try {
+    const res = await fetch(`https://api.jup.ag/price/v3?ids=${mint}`, {
+      headers: getJupiterApiKey() ? { "x-api-key": getJupiterApiKey() } : {},
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const price = data?.data?.[mint]?.price;
+    return typeof price === "number" && Number.isFinite(price) ? price : null;
+  } catch {
+    return null;
+  }
+}

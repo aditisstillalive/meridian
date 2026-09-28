@@ -486,3 +486,65 @@ export function syncOpenPositions(active_addresses) {
 
   if (changed) save(state);
 }
+
+// ─── Close Exposure Tracking (for swap_guard) ──────────────────────
+// Written by closePosition → tools/close-swap.js → recordCloseExposure.
+// Read by swap_guard to allow the agent to finish a close's own swap-back.
+
+const CLOSE_EXPOSURE_WINDOW_MS = 2 * 60 * 60 * 1000; // 2h
+const AMBIGUOUS_SWAP_WINDOW_MS = 90_000;            // 90s (about a blockhash's validity)
+
+/**
+ * @param {string} position_address
+ * @param {{ mint: string, decimals: number|null, pre_raw: string|null,
+ *   unsold_raw: string, ambiguous?: boolean }} exposure (tools/close-swap.js)
+ * @param {{ now?: number, ambiguousWindowMs?: number }} [opts]
+ */
+export function recordCloseExposure(position_address, exposure, { now = Date.now(), ambiguousWindowMs = AMBIGUOUS_SWAP_WINDOW_MS } = {}) {
+  if (!exposure?.mint) return null;
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos) return null;
+  pos.close_exposure = {
+    mint: exposure.mint,
+    decimals: Number.isInteger(exposure.decimals) ? exposure.decimals : null,
+    pre_raw: exposure.pre_raw ?? null,
+    unsold_raw: String(exposure.unsold_raw ?? "0"),
+    agent_sold_raw: "0",
+    recorded_at: new Date(now).toISOString(),
+    ambiguous_until: exposure.ambiguous ? new Date(now + ambiguousWindowMs).toISOString() : null,
+  };
+  save(state);
+  return { position: position_address, ...pos.close_exposure };
+}
+
+/**
+ * Most recent close exposure recorded for `mint` within `windowMs`, as
+ * { position, ...close_exposure }, or null.
+ */
+export function findRecentCloseExposure(mint, { now = Date.now(), windowMs = CLOSE_EXPOSURE_WINDOW_MS } = {}) {
+  if (!mint) return null;
+  const state = load();
+  let best = null;
+  for (const [address, pos] of Object.entries(state.positions || {})) {
+    const e = pos?.close_exposure;
+    if (!e || e.mint !== mint) continue;
+    const at = Date.parse(e.recorded_at);
+    if (!Number.isFinite(at) || now - at > windowMs || at > now + 60_000) continue;
+    if (!best || at > Date.parse(best.recorded_at)) best = { position: address, ...e };
+  }
+  return best;
+}
+
+/**
+ * After an agent swap_token against a close exposure: add what it sold, or
+ * open a new in-flight window when its outcome is ambiguous.
+ */
+export function noteAgentExposureSwap(position_address, { soldRaw = null, ambiguous = false } = {}, { now = Date.now(), ambiguousWindowMs = AMBIGUOUS_SWAP_WINDOW_MS } = {}) {
+  const state = load();
+  const e = state.positions[position_address]?.close_exposure;
+  if (!e) return;
+  if (soldRaw != null) e.agent_sold_raw = (BigInt(e.agent_sold_raw || "0") + BigInt(soldRaw)).toString();
+  if (ambiguous) e.ambiguous_until = new Date(now + ambiguousWindowMs).toISOString();
+  save(state);
+}

@@ -725,7 +725,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
   const confirmTicks = Math.max(1, Number(config.pnl.confirmTicks ?? 2));
   let _pnlPollBusy = false;
   const pnlPollInterval = setInterval(async () => {
-    if (_managementBusy || _screeningBusy || _pnlPollBusy) return;
+    if (_managementBusy || _pnlPollBusy) return;
     if (getTrackedPositions(true).length === 0) return;
     _pnlPollBusy = true;
     try {
@@ -1125,6 +1125,10 @@ function renderSettingsMenu(page = "main") {
       stepButtons("repeatDeployCooldownTriggerCount", "Repeat count", 1, { digits: 0 }),
       stepButtons("repeatDeployCooldownHours", "Repeat hrs", 1, { digits: 0 }),
       stepButtons("repeatDeployCooldownMinFeeEarnedPct", "Fee earned %", 0.1, { digits: 1 }),
+      [toggleButton("autoSwapAfterClaim", "Auto-swap claim")],
+      stepButtons("autoSwapRetryAttempts", "Swap retries", 1, { digits: 0 }),
+      stepButtons("autoSwapRetryDelayMs", "Retry delay", 500, { digits: 0 }),
+      stepButtons("autoSwapSettleDelayMs", "Settle delay", 1000, { digits: 0 }),
     ];
   } else if (page === "screen") {
     rows = [
@@ -1240,6 +1244,8 @@ async function applySettingsMenuCallback(msg) {
     if (key === "repeatDeployCooldownMinFeeEarnedPct") value = Math.max(0, value);
     if (["minBinsBelow", "maxBinsBelow", "defaultBinsBelow"].includes(key)) value = Math.max(35, Math.round(value));
     if (["deployAmountSol", "gasReserve", "maxDeployAmount"].includes(key)) value = Math.max(0, value);
+    if (key === "autoSwapRetryAttempts") value = Math.max(1, Math.round(value));
+    if (["autoSwapRetryDelayMs", "autoSwapSettleDelayMs"].includes(key)) value = Math.max(0, Math.round(value));
   } else if (action === "set") {
     value = normalizeMenuValue(key, parts.slice(3).join(":"));
   } else {
