@@ -284,7 +284,7 @@ export async function getOnchainTokenBalance(mint) {
       totalRaw += BigInt(amount);
       decimals = info.tokenAmount?.decimals ?? 9;
     }
-    const ui = decimals === 0 ? totalRaw.toString() : (totalRaw / 10n ** BigInt(decimals)).toFixed(decimals).replace(/\.?0+$/, "");
+    const ui = decimals === 0 ? totalRaw.toString() : (Number(totalRaw / 10n ** BigInt(decimals))).toFixed(decimals).replace(/\.?0+$/, "");
     return { raw: totalRaw, decimals, ui };
   } catch (e) {
     log("wallet_error", `getOnchainTokenBalance ${mint}: ${e.message}`);

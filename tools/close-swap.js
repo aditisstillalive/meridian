@@ -302,7 +302,7 @@ export async function swapBackWithdrawnBase({ baseMint, symbol = null, preRaw, e
   // was already sold. Zero when nothing is attributable.
   const exposureOf = (unsoldRaw) => ({
     mint: baseMint,
-    decimals,
+    decimals: decimals ?? 0,
     pre_raw: preRaw != null ? preRaw.toString() : null,
     unsold_raw: (unsoldRaw > 0n ? unsoldRaw : 0n).toString(),
     ambiguous,
