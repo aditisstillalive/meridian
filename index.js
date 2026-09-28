@@ -1058,6 +1058,14 @@ function settingValue(key) {
     rsiLength: config.indicators.rsiLength,
     indicatorIntervals: config.indicators.intervals,
     requireAllIntervals: config.indicators.requireAllIntervals,
+    autoSwapAfterClaim: config.management.autoSwapAfterClaim,
+    autoSwapRetryAttempts: config.management.autoSwapRetryAttempts,
+    autoSwapRetryDelayMs: config.management.autoSwapRetryDelayMs,
+    autoSwapSettleDelayMs: config.management.autoSwapSettleDelayMs,
+    maxSwapPriceImpactPct: config.management.maxSwapPriceImpactPct,
+    maxCloseSwapPriceImpactPct: config.management.maxCloseSwapPriceImpactPct,
+    closeSwapDustUsd: config.management.closeSwapDustUsd,
+    closeSwapToleranceBps: config.management.closeSwapToleranceBps,
   };
   return values[key];
 }
@@ -1133,6 +1141,10 @@ function renderSettingsMenu(page = "main") {
       stepButtons("autoSwapRetryAttempts", "Swap retries", 1, { digits: 0 }),
       stepButtons("autoSwapRetryDelayMs", "Retry delay", 500, { digits: 0 }),
       stepButtons("autoSwapSettleDelayMs", "Settle delay", 1000, { digits: 0 }),
+      stepButtons("maxSwapPriceImpactPct", "Swap impact %", 1, { digits: 0 }),
+      stepButtons("maxCloseSwapPriceImpactPct", "Close-swap impact %", 5, { digits: 0 }),
+      stepButtons("closeSwapDustUsd", "Dust gate $", 0.01, { digits: 2 }),
+      stepButtons("closeSwapToleranceBps", "Close tolerance bps", 100, { digits: 0 }),
     ];
   } else if (page === "screen") {
     rows = [

@@ -276,9 +276,13 @@ export async function getOnchainTokenBalance(mint) {
     let totalRaw = 0n;
     let decimals = 9;
     for (const acc of accounts.value) {
-      const data = acc.account.data.parsed.info;
-      totalRaw += BigInt(data.tokenAmount.amount);
-      decimals = data.tokenAmount.decimals ?? 9;
+      const parsed = acc.account.data?.parsed;
+      if (!parsed || !parsed.info) continue;
+      const info = parsed.info;
+      const amount = info.tokenAmount?.amount;
+      if (amount == null) continue;
+      totalRaw += BigInt(amount);
+      decimals = info.tokenAmount?.decimals ?? 9;
     }
     const ui = decimals === 0 ? totalRaw.toString() : (totalRaw / 10n ** BigInt(decimals)).toFixed(decimals).replace(/\.?0+$/, "");
     return { raw: totalRaw, decimals, ui };

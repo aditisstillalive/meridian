@@ -399,6 +399,8 @@ const toolMap = {
       pnlSanityMaxDiffPct: ["management", "pnlSanityMaxDiffPct"],
       maxSwapPriceImpactPct: ["management", "maxSwapPriceImpactPct"],
       maxCloseSwapPriceImpactPct: ["management", "maxCloseSwapPriceImpactPct"],
+      closeSwapDustUsd: ["management", "closeSwapDustUsd"],
+      closeSwapToleranceBps: ["management", "closeSwapToleranceBps"],
       // pnl poller
       pnlConfirmTicks: ["pnl", "confirmTicks"],
       // opportunity poller (interval/enabled changes apply on next restart)

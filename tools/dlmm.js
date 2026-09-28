@@ -24,9 +24,14 @@ import {
   syncOpenPositions,
   recordCloseExposure,
 } from "../state.js";
+import { recordPerformance } from "../lessons.js";
+import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
 import { swapBackWithdrawnBase, expectedBaseWithdrawRaw, expectedClaimFeeRaw } from "./close-swap.js";
-import { getOnchainTokenBalance, getTokenUsdPrice } from "./wallet.js";
-import { fetchDlmmPnlForPool, computePositions } from "./pnl.js";
+import { getOnchainTokenBalance, getTokenUsdPrice, normalizeMint } from "./wallet.js";
+import { appendDecision } from "../decision-log.js";
+import { agentMeridianJson, getAgentIdForRequests, getAgentMeridianHeaders } from "./agent-meridian.js";
+import { getAndClearStagedSignals } from "../signal-tracker.js";
+import { computePositions, fetchDlmmPnlForPool } from "./pnl.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports

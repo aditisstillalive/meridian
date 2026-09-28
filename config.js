@@ -142,6 +142,10 @@ export const config = {
     // Price impact caps for Jupiter swaps (bps)
     maxSwapPriceImpactPct: u.maxSwapPriceImpactPct ?? 5,      // agent swaps (default 5%)
     maxCloseSwapPriceImpactPct: u.maxCloseSwapPriceImpactPct ?? 25, // post-close auto-swaps (default 25%)
+    // Post-close auto-swap dust gate (USD) — amounts below this are left in wallet
+    closeSwapDustUsd: u.closeSwapDustUsd ?? 0.05,
+    // Post-close auto-swap tolerance (bps) — extra % above expected withdrawal to sell
+    closeSwapToleranceBps: u.closeSwapToleranceBps ?? 500,
   },
 
   // ─── Strategy Mapping ───────────────────
@@ -337,6 +341,8 @@ export function reloadScreeningThresholds() {
     if (fresh.volumeTrendDecelerating != null) s.volumeTrendDecelerating = fresh.volumeTrendDecelerating;
     if (fresh.maxSwapPriceImpactPct != null) s.maxSwapPriceImpactPct = fresh.maxSwapPriceImpactPct;
     if (fresh.maxCloseSwapPriceImpactPct != null) s.maxCloseSwapPriceImpactPct = fresh.maxCloseSwapPriceImpactPct;
+    if (fresh.closeSwapDustUsd != null) s.closeSwapDustUsd = fresh.closeSwapDustUsd;
+    if (fresh.closeSwapToleranceBps != null) s.closeSwapToleranceBps = fresh.closeSwapToleranceBps;
     const minBinsBelow = numericConfig(fresh.minBinsBelow) ?? config.strategy.minBinsBelow;
     const maxBinsBelow = numericConfig(fresh.maxBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.maxBinsBelow;
     const defaultBinsBelow = numericConfig(fresh.defaultBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.defaultBinsBelow ?? maxBinsBelow;

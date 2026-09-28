@@ -28,8 +28,12 @@ import { config } from "../config.js";
 
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 
-export const DUST_USD = 0.10;
-export const EXPECTED_TOLERANCE_BPS = 200n; // 2% above expected
+function getDustUsd() {
+  return Number(config.management.closeSwapDustUsd ?? 0.05);
+}
+function getExpectedToleranceBps() {
+  return BigInt(config.management.closeSwapToleranceBps ?? 500);
+}
 export const MAX_ATTEMPTS = 3;
 /** Delays before each post-close read on the first attempt: ~15s total. */
 export const POLL_DELAYS_MS = [0, 500, 1000, 1500, 2000, 2500, 3000, 4500];
@@ -136,7 +140,8 @@ export async function swapBackWithdrawnBase({ baseMint, symbol = null, preRaw, e
   }
 
   const expectedKnown = typeof expectedRaw === "bigint" && expectedRaw >= 0n;
-  const tol = expectedKnown ? (expectedRaw * EXPECTED_TOLERANCE_BPS) / 10000n : 0n;
+  const toleranceBps = getExpectedToleranceBps();
+  const tol = expectedKnown ? (expectedRaw * toleranceBps) / 10000n : 0n;
   const capRaw = expectedKnown ? expectedRaw + tol : null;
   // Poll target, in total withdrawn seen (unsold delta + already sold).
   let targetRaw = 1n;
@@ -196,7 +201,7 @@ export async function swapBackWithdrawnBase({ baseMint, symbol = null, preRaw, e
       if (sellRaw > remainingCap) {
         unsoldOverExpectedRaw = sellRaw - remainingCap;
         sellRaw = remainingCap;
-        log("close_warn", `Post-close ${label} delta ${ui(r.delta)} exceeds the expected withdrawal ${ui(expectedRaw)} (+${EXPECTED_TOLERANCE_BPS / 100n}%); selling at most ${ui(sellRaw)} and leaving ${ui(unsoldOverExpectedRaw)} that is not attributable to this close.`);
+        log("close_warn", `Post-close ${label} delta ${ui(r.delta)} exceeds the expected withdrawal ${ui(expectedRaw)} (+${Number(toleranceBps) / 100}%); selling at most ${ui(sellRaw)} and leaving ${ui(unsoldOverExpectedRaw)} that is not attributable to this close.`);
       }
     }
 
@@ -230,10 +235,11 @@ export async function swapBackWithdrawnBase({ baseMint, symbol = null, preRaw, e
     const sellUi = rawToUiString(sellRaw, decimals);
     const price = await pricePromise;
     const sellUsd = price != null ? Number(sellUi) * price : null;
-    if (sellUsd != null && sellUsd < DUST_USD) {
+    const dustUsd = getDustUsd();
+    if (sellUsd != null && sellUsd < dustUsd) {
       dustSkipped = true;
       if (soldRaw > 0n) succeeded = true;
-      log("close", `Post-close swap: leaving ${sellUi} ${label} (~$${sellUsd.toFixed(4)}), under the $${DUST_USD.toFixed(2)} dust gate.`);
+      log("close", `Post-close swap: leaving ${sellUi} ${label} (~$${sellUsd.toFixed(4)}), under the $${dustUsd.toFixed(2)} dust gate.`);
       break;
     }
 
@@ -297,7 +303,7 @@ export async function swapBackWithdrawnBase({ baseMint, symbol = null, preRaw, e
   const exposureOf = (unsoldRaw) => ({
     mint: baseMint,
     decimals,
-    pre_raw: preRaw.toString(),
+    pre_raw: preRaw != null ? preRaw.toString() : null,
     unsold_raw: (unsoldRaw > 0n ? unsoldRaw : 0n).toString(),
     ambiguous,
   });
