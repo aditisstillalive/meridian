@@ -300,11 +300,19 @@ export async function swapBackWithdrawnBase({ baseMint, symbol = null, preRaw, e
   // What a later agent swap_token may sell for this close (tools/swap-guard.js):
   // the unsold withdrawn delta, clamped to the expected withdrawal minus what
   // was already sold. Zero when nothing is attributable.
+  function safeToString(v) {
+    if (v == null) return null;
+    if (typeof v === "bigint") return v.toString();
+    if (typeof v === "number") return String(v);
+    if (typeof v === "string") return v;
+    try { return String(v); } catch { return null; }
+  }
+
   const exposureOf = (unsoldRaw) => ({
     mint: baseMint,
-    decimals: decimals ?? 0,
-    pre_raw: preRaw != null ? preRaw.toString() : null,
-    unsold_raw: (unsoldRaw > 0n ? unsoldRaw : 0n).toString(),
+    decimals: Number.isInteger(decimals) ? decimals : 0,
+    pre_raw: safeToString(preRaw),
+    unsold_raw: safeToString(unsoldRaw > 0n ? unsoldRaw : 0n),
     ambiguous,
   });
 
