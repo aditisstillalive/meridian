@@ -26,6 +26,7 @@ import {
 } from "../state.js";
 import { swapBackWithdrawnBase, expectedBaseWithdrawRaw, expectedClaimFeeRaw } from "./close-swap.js";
 import { getOnchainTokenBalance, getTokenUsdPrice } from "./wallet.js";
+import { fetchDlmmPnlForPool } from "./pnl.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
