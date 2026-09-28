@@ -24,17 +24,8 @@ import {
   syncOpenPositions,
   recordCloseExposure,
 } from "../state.js";
-import { swapBackWithdrawnBase, expectedBaseWithdrawRaw } from "./close-swap.js";
-import { getOnchainTokenBalance, getTokenUsdPrice } from "./wallet.js";
-import { recordPerformance } from "../lessons.js";
-import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
-import { normalizeMint } from "./wallet.js";
-import { appendDecision } from "../decision-log.js";
-import { agentMeridianJson, getAgentIdForRequests, getAgentMeridianHeaders } from "./agent-meridian.js";
-import { getAndClearStagedSignals } from "../signal-tracker.js";
-import { computePositions, fetchDlmmPnlForPool } from "./pnl.js";
 import { swapBackWithdrawnBase, expectedBaseWithdrawRaw, expectedClaimFeeRaw } from "./close-swap.js";
-import { getOnchainTokenBalance } from "./wallet.js";
+import { getOnchainTokenBalance, getTokenUsdPrice } from "./wallet.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -1975,52 +1966,6 @@ export async function closePosition({ position_address, reason }) {
     }
 
     recordClose(position_address, reason || "agent decision");
-
-    // ─── Post-close: swap withdrawn base token back to SOL ───────
-    let swapOutcome = null;
-    let exposureFlag = false;
-    let exposure = null;
-    let closeSwapTxs = [];
-    if (preCloseRaw != null && preCloseDecimals != null) {
-      // Calculate expected withdrawal: position X liquidity + claimable X fees
-      let expectedRaw = 0n;
-      try {
-        const positionDataForClose = await pool.getPosition(positionPubKey);
-        const baseWithdraw = expectedBaseWithdrawRaw(pool, positionDataForClose, closeBaseMint);
-        const claimFee = expectedClaimFeeRaw(pool, positionDataForClose, closeBaseMint);
-        if (baseWithdraw != null) expectedRaw += baseWithdraw;
-        if (claimFee != null) expectedRaw += claimFee;
-        log("close", `Expected withdrawal for ${closeBaseMint.slice(0, 8)}: ${baseWithdraw?.toString() || "unknown"} (liq) + ${claimFee?.toString() || "unknown"} (fee) = ${expectedRaw.toString()}`);
-      } catch (e) {
-        log("close_warn", `Could not compute expected withdrawal: ${e.message}`);
-      }
-
-      const swapResult = await swapBackWithdrawnBase({
-        baseMint: closeBaseMint,
-        symbol: tracked?.pool_name?.split("-")[0] || closeBaseMint.slice(0, 8),
-        preRaw: preCloseRaw,
-        expectedRaw: expectedRaw > 0n ? expectedRaw : null,
-      });
-      swapOutcome = swapResult.swapOutcome;
-      exposureFlag = swapResult.exposureFlag;
-      exposure = swapResult.exposure;
-      closeSwapTxs = swapResult.txs;
-
-      // Record exposure for agent swap_guard
-      if (exposure) {
-        const ambiguousUntil = swapOutcome?.ambiguous ? new Date(Date.now() + 90_000).toISOString() : null;
-        recordCloseExposure({
-          position: position_address,
-          mint: closeBaseMint,
-          preRaw: preCloseRaw,
-          decimals: preCloseDecimals,
-          unsoldRaw: typeof exposure.unsold_raw === "string" ? BigInt(exposure.unsold_raw) : 0n,
-          ambiguousUntil,
-        });
-      }
-    } else {
-      log("close_warn", `Skipping post-close swap: pre-close balance unknown for ${closeBaseMint}`);
-    }
 
     // Record performance for learning
     if (tracked) {
