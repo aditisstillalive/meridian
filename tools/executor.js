@@ -26,6 +26,7 @@ import fs from "fs";
 import { execSync, spawn } from "child_process";
 import { REPO_ROOT, repoPath } from "../repo-root.js";
 import { normalizeTimeframe, scaleScreeningToTimeframe } from "../screening-scales.js";
+import { registerChildProcess } from "../index.js";
 
 const USER_CONFIG_PATH = repoPath("user-config.json");
 const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
@@ -288,6 +289,7 @@ const toolMap = {
             cwd: REPO_ROOT,
           });
           child.unref();
+          registerChildProcess(child);
         }
         process.exit(0);
       }, 3000);

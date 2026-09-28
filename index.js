@@ -95,6 +95,20 @@ let _screeningLastTriggered = 0; // epoch ms — prevents management from spammi
 // Exit/peak confirmation is now done by consecutive-tick counting in state.js
 // (registerExitSignal / confirmPeak), driven by the 3s RPC poller — no setTimeout rechecks.
 
+// Track spawned child processes for clean shutdown
+const _childProcesses = [];
+
+/** Register a child process to be killed on shutdown */
+export function registerChildProcess(child) {
+  if (child && typeof child.kill === "function") {
+    _childProcesses.push(child);
+    child.on("exit", () => {
+      const idx = _childProcesses.indexOf(child);
+      if (idx >= 0) _childProcesses.splice(idx, 1);
+    });
+  }
+}
+
 /** Strip <think>...</think> reasoning blocks that some models leak into output */
 function stripThink(text) {
   if (!text) return text;
@@ -854,6 +868,27 @@ async function shutdown(signal) {
   _shuttingDown = true;
 
   log("shutdown", `Received ${signal}. Shutting down...`);
+
+  // Kill all tracked child processes first
+  for (const child of _childProcesses) {
+    try {
+      child.kill("SIGTERM");
+      log("shutdown", `Killed child process PID ${child.pid}`);
+    } catch (e) {
+      log("shutdown_warn", `Failed to kill child PID ${child.pid}: ${e.message}`);
+    }
+  }
+  // Wait briefly for graceful exit
+  if (_childProcesses.length > 0) {
+    await new Promise((r) => setTimeout(r, 1000));
+    // Force kill any remaining
+    for (const child of _childProcesses) {
+      try {
+        if (!child.killed) child.kill("SIGKILL");
+      } catch { }
+    }
+  }
+
   stopPolling();
   stopCronJobs();
 
