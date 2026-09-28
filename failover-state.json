@@ -1,0 +1,29 @@
+{
+  "rpc": {
+    "providers": [
+      {
+        "url": "https://pump.helius-rpc.com",
+        "cooldownUntil": null,
+        "consecutiveFailures": 0
+      },
+      {
+        "url": "https://api.mainnet-beta.solana.com",
+        "cooldownUntil": null,
+        "consecutiveFailures": 0
+      }
+    ],
+    "lastSwitch": null,
+    "lastSwitchReason": null
+  },
+  "meteora": {
+    "providers": [
+      {
+        "url": "https://dlmm.datapi.meteora.ag",
+        "cooldownUntil": null,
+        "consecutiveFailures": 0
+      }
+    ],
+    "lastSwitch": null,
+    "lastSwitchReason": null
+  }
+}

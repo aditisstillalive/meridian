@@ -32,12 +32,31 @@ function normalizeSymbol(symbol) {
   return String(symbol || "").trim().toUpperCase();
 }
 
+/**
+ * Categorize volume trend from volume_change_pct.
+ * Accelerating: volume growing (> -threshold)
+ * Stable: volume flat (within ±threshold)
+ * Decelerating: volume shrinking (< threshold) — contains ALL catastrophic losses in historical data
+ */
+export function categorizeVolumeTrend(volumeChangePct, deceleratingThreshold = -15) {
+  const v = Number(volumeChangePct);
+  if (!Number.isFinite(v)) return "unknown";
+  if (v < deceleratingThreshold) return "decelerating";
+  if (v > Math.abs(deceleratingThreshold)) return "accelerating";
+  return "stable";
+}
+
 export function scoreCandidate(pool) {
   const feeTvl = Number(pool.fee_active_tvl_ratio || 0);
   const organic = Number(pool.organic_score || 0);
   const volume = Number(pool.volume_window || 0);
   const holders = Number(pool.holders || 0);
-  return feeTvl * 1000 + organic * 10 + volume / 100 + holders / 100;
+  let score = feeTvl * 1000 + organic * 10 + volume / 100 + holders / 100;
+  // Penalize decelerating volume: ALL catastrophic losses came from decelerating pools.
+  // A ~30% penalty drops a borderline candidate below otherwise-equal peers without
+  // removing it entirely — the hard filter in getTopCandidates does that.
+  if (pool._volume_trend === "decelerating") score *= 0.7;
+  return score;
 }
 
 /**
@@ -350,10 +369,11 @@ async function findRivalPool(mint) {
   return pools.find((pool) => pool?.token_x?.address === mint || pool?.token_y?.address === mint) || null;
 }
 
-async function enrichPvpRisk(pools) {
+export async function enrichPvpRisk(pools, { shortlistLimit = PVP_SHORTLIST_LIMIT } = {}) {
+  const limit = Math.max(0, Number(shortlistLimit) || 0);
   const shortlist = [...pools]
     .sort((a, b) => scoreCandidate(b) - scoreCandidate(a))
-    .slice(0, PVP_SHORTLIST_LIMIT);
+    .slice(0, limit);
 
   if (shortlist.length === 0) return;
 
@@ -644,6 +664,16 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         log("screening", `Filtered cooldown token ${p.base?.symbol} (${p.base?.mint?.slice(0, 8)})`);
         pushFilteredReason(filteredOut, p, "token cooldown active");
         return false;
+      }
+      // Volume trend filter: decelerating volume = all catastrophic losses in historical data.
+      // Enabled by default; set volumeTrendEnabled=false in config to disable.
+      if (config.screening.volumeTrendEnabled !== false) {
+        const trend = categorizeVolumeTrend(p.volume_change_pct, config.screening.volumeTrendDecelerating);
+        p._volume_trend = trend;
+        if (trend === "decelerating") {
+          pushFilteredReason(filteredOut, p, `volume decelerating (${Number(p.volume_change_pct).toFixed(1)}% < ${config.screening.volumeTrendDecelerating}%)`);
+          return false;
+        }
       }
       return true;
     })

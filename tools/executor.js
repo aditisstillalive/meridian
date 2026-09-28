@@ -10,6 +10,7 @@ import {
   searchPools,
 } from "./dlmm.js";
 import { getWalletBalances, swapToken } from "./wallet.js";
+import { checkSwapGuard, recordSwapGuardResult } from "./swap-guard.js";
 import { studyTopLPers } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
 import { setPositionInstruction } from "../state.js";
@@ -369,6 +370,8 @@ const toolMap = {
       blockedLaunchpads: ["screening", "blockedLaunchpads"],
       minTokenAgeHours: ["screening", "minTokenAgeHours"],
       maxTokenAgeHours: ["screening", "maxTokenAgeHours"],
+      volumeTrendEnabled: ["screening", "volumeTrendEnabled"],
+      volumeTrendDecelerating: ["screening", "volumeTrendDecelerating"],
       minFeePerTvl24h: ["management", "minFeePerTvl24h"],
       loneCandidateMinDegen: ["screening", "loneCandidateMinDegen"],
       // management
@@ -376,8 +379,10 @@ const toolMap = {
       autoSwapAfterClaim: ["management", "autoSwapAfterClaim"],
       autoSwapRetryAttempts: ["management", "autoSwapRetryAttempts"],
       autoSwapRetryDelayMs: ["management", "autoSwapRetryDelayMs"],
+      autoSwapSettleDelayMs: ["management", "autoSwapSettleDelayMs"],
       outOfRangeBinsToClose: ["management", "outOfRangeBinsToClose"],
       outOfRangeWaitMinutes: ["management", "outOfRangeWaitMinutes"],
+      oorHoldIfGreenPct: ["management", "oorHoldIfGreenPct"],
       oorCooldownTriggerCount: ["management", "oorCooldownTriggerCount"],
       oorCooldownHours: ["management", "oorCooldownHours"],
       repeatDeployCooldownEnabled: ["management", "repeatDeployCooldownEnabled"],
@@ -600,40 +605,6 @@ const PROTECTED_TOOLS = new Set([
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
- * Swap a base token back to SOL with retry. Jupiter can transiently fail (no route,
- * quote error) and a single attempt silently leaves the token unsold — this retries
- * with a delay, re-fetching the balance each attempt (amounts can shift on partial
- * fills). Treats both a throw AND result.success===false / missing tx as failure.
- * Returns { swapped, result, token } — swapped=false if nothing to do or all attempts failed.
- */
-async function swapBaseToSolWithRetry(baseMint, label) {
-  const attempts = Math.max(1, Number(config.management.autoSwapRetryAttempts ?? 3));
-  const delayMs = Math.max(0, Number(config.management.autoSwapRetryDelayMs ?? 3000));
-  let lastErr = null;
-  for (let attempt = 1; attempt <= attempts; attempt++) {
-    try {
-      const balances = await getWalletBalances({});
-      const token = balances.tokens?.find((t) => t.mint === baseMint);
-      if (!token || token.usd < 0.10) {
-        // Nothing left to swap (already sold or dust) — treat as done.
-        return { swapped: attempt > 1, result: null, token: null };
-      }
-      log("executor", `Auto-swapping ${label} ${token.symbol || baseMint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL (attempt ${attempt}/${attempts})`);
-      const swapResult = await swapToken({ input_mint: baseMint, output_mint: "SOL", amount: token.balance });
-      const ok = swapResult && swapResult.success !== false && !swapResult.error && (swapResult.tx || swapResult.amount_out);
-      if (ok) return { swapped: true, result: swapResult, token };
-      lastErr = swapResult?.error || swapResult?.reason || "swap returned no tx";
-    } catch (e) {
-      lastErr = e.message;
-    }
-    log("executor_warn", `Auto-swap ${label} attempt ${attempt}/${attempts} failed: ${lastErr}`);
-    if (attempt < attempts) await sleep(delayMs);
-  }
-  log("executor_warn", `Auto-swap ${label} failed after ${attempts} attempts — base token left unsold (${baseMint.slice(0, 8)})`);
-  return { swapped: false, result: null, token: null };
-}
-
-/**
  * Execute a tool call with safety checks and logging.
  */
 export async function executeTool(name, args) {
@@ -679,6 +650,8 @@ export async function executeTool(name, args) {
     if (success) {
       if (name === "swap_token" && result.tx) {
         notifySwap({ inputSymbol: args.input_mint?.slice(0, 8), outputSymbol: args.output_mint === "So11111111111111111111111111111111111111112" || args.output_mint === "SOL" ? "SOL" : args.output_mint?.slice(0, 8), amountIn: result.amount_in, amountOut: result.amount_out, tx: result.tx }).catch(() => {});
+        // Record swap for close-exposure tracking (swap_guard)
+        recordSwapGuardResult({ input_mint: args.input_mint, amount: args.amount, tx: result.tx }).catch(() => {});
       } else if (name === "deploy_position") {
         notifyDeploy({ pair: result.pool_name || args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, position: result.position, tx: result.txs?.[0] ?? result.tx, priceRange: result.price_range, rangeCoverage: result.range_coverage, binStep: result.bin_step, baseFee: result.base_fee }).catch(() => {});
       } else if (name === "close_position") {
@@ -688,18 +661,11 @@ export async function executeTool(name, args) {
           const poolAddr = result.pool || args.pool_address;
           if (poolAddr) addPoolNote({ pool_address: poolAddr, note: `Closed: low yield (fee/TVL below threshold) at ${new Date().toISOString().slice(0,10)}` }).catch?.(() => {});
         }
-        // Auto-swap base token back to SOL unless user said to hold (retried).
-        if (!args.skip_swap && result.base_mint) {
-          const { swapped, result: swapResult } = await swapBaseToSolWithRetry(result.base_mint, "after close");
-          if (swapped) {
-            // Tell the model the swap already happened so it doesn't call swap_token again
-            result.auto_swapped = true;
-            result.auto_swap_note = `Base token already auto-swapped back to SOL (${result.base_mint.slice(0, 8)} → SOL). Do NOT call swap_token again.`;
-            if (swapResult?.amount_out) result.sol_received = swapResult.amount_out;
-          }
-        }
+        // Auto-swap is now handled by close-swap integration in dlmm.js (delta-swap)
+        // Result includes auto_swapped, swap_outcome, exposure fields.
       } else if (name === "claim_fees" && config.management.autoSwapAfterClaim && result.base_mint) {
-        await swapBaseToSolWithRetry(result.base_mint, "after claim");
+        // Legacy auto-swap after claim — disabled by default. Could be reimplemented
+        // with a simpler delta approach if needed. For now, skip to avoid double-swap.
       }
     }
 

@@ -73,7 +73,7 @@ export async function getWalletBalances() {
   try {
     const url = `https://api.helius.xyz/v1/wallet/${walletAddress}/balances?api-key=${HELIUS_KEY}`;
     const res = await fetch(url);
-    
+
     if (!res.ok) {
       throw new Error(`Helius API error: ${res.status} ${res.statusText}`);
     }
@@ -132,9 +132,9 @@ export function normalizeMint(mint) {
   if (!mint) return mint;
   const SOL_MINT = "So11111111111111111111111111111111111111112";
   if (
-    mint === "SOL" || 
-    mint === "native" || 
-    /^So1+$/.test(mint) || 
+    mint === "SOL" ||
+    mint === "native" ||
+    /^So1+$/.test(mint) ||
     (mint.length >= 32 && mint.length <= 44 && mint.startsWith("So1") && mint !== SOL_MINT)
   ) {
     return SOL_MINT;

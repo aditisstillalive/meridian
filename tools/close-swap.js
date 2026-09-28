@@ -24,6 +24,7 @@
  */
 import { log as defaultLog } from "../logger.js";
 import { getOnchainTokenBalance, getTokenUsdPrice, swapToken } from "./wallet.js";
+import { config } from "../config.js";
 
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 

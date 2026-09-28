@@ -98,16 +98,24 @@ export const config = {
     blockedLaunchpads:  u.blockedLaunchpads  ?? [],  // e.g. ["letsbonk.fun", "pump.fun"]
     minTokenAgeHours:   u.minTokenAgeHours   ?? null, // null = no minimum
     maxTokenAgeHours:   u.maxTokenAgeHours   ?? null, // null = no maximum
+    // Volume trend filter: reject pools with decelerating volume.
+    // Decelerating volume is the only signal containing ALL catastrophic losses
+    // in historical data (avg PnL: accelerating +0.21%, stable +0.42%, decelerating -0.23%).
+    volumeTrendEnabled: u.volumeTrendEnabled ?? true,
+    volumeTrendDecelerating: u.volumeTrendDecelerating ?? -15, // pct threshold; below = decelerating
   },
 
   // ─── Position Management ────────────────
   management: {
     minClaimAmount:        u.minClaimAmount        ?? 5,
     autoSwapAfterClaim:    u.autoSwapAfterClaim    ?? false,
-    autoSwapRetryAttempts: u.autoSwapRetryAttempts ?? 3,    // retries for base→SOL auto-swap on Jupiter failure
-    autoSwapRetryDelayMs:  u.autoSwapRetryDelayMs  ?? 3000, // delay between auto-swap retries
+    autoSwapRetryAttempts: u.autoSwapRetryAttempts ?? 3,     // retries for base→SOL auto-swap on Jupiter failure
+    autoSwapRetryDelayMs:  u.autoSwapRetryDelayMs  ?? 3000,  // delay between auto-swap retries
+    autoSwapSettleDelayMs: u.autoSwapSettleDelayMs ?? 8000,  // wait before first balance check (let token account settle)
     outOfRangeBinsToClose: u.outOfRangeBinsToClose ?? 10,
     outOfRangeWaitMinutes: u.outOfRangeWaitMinutes ?? 30,
+    // Hold OOR position if PnL >= this threshold (0 = disabled)
+    oorHoldIfGreenPct: u.oorHoldIfGreenPct ?? 0,
     oorCooldownTriggerCount: u.oorCooldownTriggerCount ?? 3,
     oorCooldownHours:       u.oorCooldownHours       ?? 12,
     repeatDeployCooldownEnabled: u.repeatDeployCooldownEnabled ?? true,
