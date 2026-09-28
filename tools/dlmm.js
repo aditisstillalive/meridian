@@ -2129,12 +2129,12 @@ export async function closePosition({ position_address, reason }) {
         pool_name: tracked.pool_name || poolMeta.name || null,
         claim_txs: claimTxHashes,
         close_txs: closeTxHashes,
-        txs: [...txHashes, ...closeSwapTxs],
+        txs: txHashes,
         pnl_usd: pnlUsd,
         pnl_pct: pnlPct,
         base_mint: closeBaseMint,
-swap_outcome: swapOutcome,
-        exposure,
+        swap_outcome: swapOutcome,
+        exposure: exposureFlag ? "success_with_exposure" : null,
         auto_swapped: !exposureFlag && swapOutcome?.success,
       };
     }
