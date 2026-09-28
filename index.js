@@ -930,6 +930,10 @@ function getDeterministicCloseRule(position, managementConfig) {
     position.active_bin > position.upper_bin &&
     (position.minutes_out_of_range ?? 0) >= managementConfig.outOfRangeWaitMinutes
   ) {
+    const holdThresh = managementConfig.oorHoldIfGreenPct ?? 0;
+    if (holdThresh > 0 && position.pnl_pct != null && position.pnl_pct >= holdThresh) {
+      return null; // hold profitable OOR position
+    }
     return { action: "CLOSE", rule: 4, reason: "OOR" };
   }
   if (

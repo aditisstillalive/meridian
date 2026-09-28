@@ -114,6 +114,8 @@ export const config = {
     autoSwapSettleDelayMs: u.autoSwapSettleDelayMs ?? 8000,  // wait before first balance check (let token account settle)
     outOfRangeBinsToClose: u.outOfRangeBinsToClose ?? 10,
     outOfRangeWaitMinutes: u.outOfRangeWaitMinutes ?? 30,
+    // Hold OOR position if PnL >= this threshold (0 = disabled)
+    oorHoldIfGreenPct: u.oorHoldIfGreenPct ?? 0,
     oorCooldownTriggerCount: u.oorCooldownTriggerCount ?? 3,
     oorCooldownHours:       u.oorCooldownHours       ?? 12,
     repeatDeployCooldownEnabled: u.repeatDeployCooldownEnabled ?? true,
