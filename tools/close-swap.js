@@ -34,11 +34,11 @@ function getDustUsd() {
 function getExpectedToleranceBps() {
   return BigInt(config.management.closeSwapToleranceBps ?? 500);
 }
-export const MAX_ATTEMPTS = 3;
-/** Delays before each post-close read on the first attempt: ~15s total. */
-export const POLL_DELAYS_MS = [0, 500, 1000, 1500, 2000, 2500, 3000, 4500];
+export const MAX_ATTEMPTS = 4;
+/** Delays before each post-close read on the first attempt: ~35s total. */
+export const POLL_DELAYS_MS = [0, 500, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000];
 /** Delay before the balance re-read of attempt N (index 0 is the poll above). */
-export const RETRY_BACKOFF_MS = [0, 1500, 3000];
+export const RETRY_BACKOFF_MS = [0, 3000, 5000];
 
 // A price-impact refusal (wallet.js maxSwapPriceImpactPct) is terminal too: an
 // immediate retry would quote the same thin route.
