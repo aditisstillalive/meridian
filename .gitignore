@@ -41,6 +41,7 @@ docs/
 
 # Discord listener queue
 discord-signals.json
+failover-state.json
 
 # Playwright MCP browser logs
 .playwright-mcp/

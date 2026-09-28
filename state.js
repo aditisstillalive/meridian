@@ -486,3 +486,73 @@ export function syncOpenPositions(active_addresses) {
 
   if (changed) save(state);
 }
+
+/**
+ * Record close exposure for a mint so the agent can finish the swap-back later.
+ * Called by closePosition after a close withdraws base token.
+ * @param {object} params
+ * @param {string} params.position - position address
+ * @param {string} params.mint - base token mint
+ * @param {bigint} params.preRaw - pre-close on-chain balance (raw)
+ * @param {number} params.decimals - token decimals
+ * @param {bigint} [params.unsoldRaw] - unsold amount (raw) from the close (defaults to 0)
+ * @param {string} [params.ambiguousUntil] - ISO timestamp when ambiguous swap window expires
+ * @param {bigint} [params.agentSoldRaw] - amount the agent already sold against this exposure (default 0)
+ */
+export function recordCloseExposure({ position, mint, preRaw, decimals, unsoldRaw = 0n, ambiguousUntil = null, agentSoldRaw = 0n }) {
+  const state = load();
+  if (!state.close_exposure) state.close_exposure = [];
+  // Upsert by position+mint
+  const existingIdx = state.close_exposure.findIndex(e => e.position === position && e.mint === mint);
+  const entry = {
+    position,
+    mint,
+    pre_raw: preRaw.toString(),
+    decimals,
+    unsold_raw: unsoldRaw.toString(),
+    agent_sold_raw: agentSoldRaw.toString(),
+    created_at: new Date().toISOString(),
+    ambiguous_until: ambiguousUntil,
+  };
+  if (existingIdx >= 0) {
+    state.close_exposure[existingIdx] = entry;
+  } else {
+    state.close_exposure.push(entry);
+  }
+  // Prune old entries (> 48h)
+  const cutoff = Date.now() - 48 * 60 * 60 * 1000;
+  state.close_exposure = state.close_exposure.filter(e => new Date(e.created_at).getTime() > cutoff);
+  save(state);
+}
+
+/**
+ * Find recent close exposure for a mint (for swap_guard).
+ * Returns the most recent matching exposure within windowMs, or null.
+ * @param {string} mint
+ * @param {object} opts { now, windowMs }
+ */
+export function findRecentCloseExposure(mint, { now, windowMs }) {
+  const state = load();
+  if (!state.close_exposure?.length) return null;
+  const cutoff = now - windowMs;
+  const matches = state.close_exposure
+    .filter(e => e.mint === mint && new Date(e.created_at).getTime() > cutoff)
+    .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+  return matches[0] || null;
+}
+
+/**
+ * Increment agent_sold_raw for a close exposure (when agent swap_token succeeds).
+ * @param {string} position
+ * @param {string} mint
+ * @param {bigint} soldRaw
+ */
+export function recordAgentSoldExposure(position, mint, soldRaw) {
+  const state = load();
+  if (!state.close_exposure?.length) return;
+  const entry = state.close_exposure.find(e => e.position === position && e.mint === mint);
+  if (entry) {
+    entry.agent_sold_raw = (BigInt(entry.agent_sold_raw) + soldRaw).toString();
+    save(state);
+  }
+}

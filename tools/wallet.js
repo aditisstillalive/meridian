@@ -146,7 +146,7 @@ export async function swapToken({
   input_mint,
   output_mint,
   amount,
-}) {
+}, options = {}) {
   input_mint  = normalizeMint(input_mint);
   output_mint = normalizeMint(output_mint);
 
@@ -178,6 +178,15 @@ export async function swapToken({
       amount: amountStr,
       taker: wallet.publicKey.toString(),
     });
+
+    // Price impact cap: "agent" (default 5%) or "close" (configurable, default 25%)
+    const impactCap = options.impactCap === "close"
+      ? Number(config.management.maxCloseSwapPriceImpactPct ?? 25)
+      : Number(config.management.maxSwapPriceImpactPct ?? 5);
+    if (impactCap > 0) {
+      search.set("maxPriceImpactBps", String(Math.round(impactCap * 100)));
+    }
+
     const referralParams = getJupiterReferralParams();
     if (referralParams) {
       search.set("referralAccount", referralParams.referralAccount);
@@ -248,4 +257,61 @@ export async function swapToken({
     log("swap_error", error.message);
     return { success: false, error: error.message };
   }
+}
+
+/**
+ * Read on-chain token balance directly via RPC (confirmed commitment).
+ * Returns { raw: bigint, decimals: number, ui: string }.
+ * Uses `confirmed` commitment to see the latest state after a tx lands.
+ */
+export async function getOnchainTokenBalance(mint) {
+  const connection = getConnection();
+  const wallet = getWallet();
+  const mintPk = new PublicKey(mint);
+
+  try {
+    const accounts = await connection.getTokenAccountsByOwner(wallet.publicKey, { mint: mintPk }, "confirmed");
+    if (!accounts.value.length) return { raw: 0n, decimals: 0, ui: "0" };
+    // Sum all token accounts for this mint (should be 1 in practice)
+    let totalRaw = 0n;
+    let decimals = 9;
+    for (const acc of accounts.value) {
+      const data = acc.account.data.parsed.info;
+      totalRaw += BigInt(data.tokenAmount.amount);
+      decimals = data.tokenAmount.decimals ?? 9;
+    }
+    const ui = decimals === 0 ? totalRaw.toString() : (totalRaw / 10n ** BigInt(decimals)).toFixed(decimals).replace(/\.?0+$/, "");
+    return { raw: totalRaw, decimals, ui };
+  } catch (e) {
+    log("wallet_error", `getOnchainTokenBalance ${mint}: ${e.message}`);
+    return { raw: 0n, decimals: 0, ui: "0" };
+  }
+}
+
+/**
+ * Fetch USD price for a mint from Jupiter price API v3.
+ */
+export async function getTokenUsdPrice(mint) {
+  try {
+    const normalized = normalizeMint(mint);
+    const url = `${JUPITER_PRICE_API}?ids=${normalized}&vsTokens=SOL`;
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const price = data?.data?.[normalized]?.price;
+    return typeof price === "number" ? price : null;
+  } catch {
+    return null;
+  }
+}
+
+/** UI decimal string (e.g. "1.234") → raw integer (bigint) using the given decimals. */
+export function uiToRawAmount(uiString, decimals) {
+  const dec = Number(decimals);
+  if (!Number.isInteger(dec) || dec < 0) throw new Error(`Invalid decimals: ${decimals}`);
+  const s = String(uiString).trim();
+  if (!s) throw new Error("Empty amount string");
+  const [intPart = "0", fracPart = ""] = s.split(".");
+  const frac = (fracPart + "0".repeat(dec)).slice(0, dec);
+  return BigInt(intPart) * 10n ** BigInt(dec) + BigInt(frac);
 }

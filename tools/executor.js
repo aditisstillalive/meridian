@@ -393,6 +393,8 @@ const toolMap = {
       trailingTriggerPct: ["management", "trailingTriggerPct"],
       trailingDropPct: ["management", "trailingDropPct"],
       pnlSanityMaxDiffPct: ["management", "pnlSanityMaxDiffPct"],
+      maxSwapPriceImpactPct: ["management", "maxSwapPriceImpactPct"],
+      maxCloseSwapPriceImpactPct: ["management", "maxCloseSwapPriceImpactPct"],
       // pnl poller
       pnlConfirmTicks: ["pnl", "confirmTicks"],
       // opportunity poller (interval/enabled changes apply on next restart)
@@ -873,6 +875,14 @@ async function runSafetyChecks(name, args) {
     case "swap_token": {
       // Basic check — prevent swapping when DRY_RUN is true
       // (handled inside swapToken itself, but belt-and-suspenders)
+      if (process.env.DRY_RUN === "true") return { pass: true };
+
+      // Guard: only allow finishing a close's swap-back (token -> SOL)
+      const { checkAgentSwap } = await import("./swap-guard.js");
+      const guard = await checkAgentSwap(args);
+      if (!guard.pass) return { pass: false, reason: guard.reason };
+      // Clamp the amount to what the guard says is sellable
+      if (guard.args?.amount) args.amount = guard.args.amount;
       return { pass: true };
     }
 

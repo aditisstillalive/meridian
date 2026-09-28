@@ -131,6 +131,9 @@ export const config = {
     pnlSanityMaxDiffPct:   u.pnlSanityMaxDiffPct   ?? 5,    // max allowed diff between reported and derived pnl % before ignoring a tick
     // SOL mode — positions, PnL, and balances reported in SOL instead of USD
     solMode:               u.solMode               ?? false,
+    // Price impact caps for Jupiter swaps (bps)
+    maxSwapPriceImpactPct: u.maxSwapPriceImpactPct ?? 5,      // agent swaps (default 5%)
+    maxCloseSwapPriceImpactPct: u.maxCloseSwapPriceImpactPct ?? 25, // post-close auto-swaps (default 25%)
   },
 
   // ─── Strategy Mapping ───────────────────
@@ -322,6 +325,10 @@ export function reloadScreeningThresholds() {
     if (fresh.maxBotHoldersPct  != null) s.maxBotHoldersPct = fresh.maxBotHoldersPct;
     if (fresh.allowedLaunchpads !== undefined) s.allowedLaunchpads = fresh.allowedLaunchpads;
     if (fresh.blockedLaunchpads !== undefined) s.blockedLaunchpads = fresh.blockedLaunchpads;
+    if (fresh.volumeTrendEnabled !== undefined) s.volumeTrendEnabled = fresh.volumeTrendEnabled;
+    if (fresh.volumeTrendDecelerating != null) s.volumeTrendDecelerating = fresh.volumeTrendDecelerating;
+    if (fresh.maxSwapPriceImpactPct != null) s.maxSwapPriceImpactPct = fresh.maxSwapPriceImpactPct;
+    if (fresh.maxCloseSwapPriceImpactPct != null) s.maxCloseSwapPriceImpactPct = fresh.maxCloseSwapPriceImpactPct;
     const minBinsBelow = numericConfig(fresh.minBinsBelow) ?? config.strategy.minBinsBelow;
     const maxBinsBelow = numericConfig(fresh.maxBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.maxBinsBelow;
     const defaultBinsBelow = numericConfig(fresh.defaultBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.defaultBinsBelow ?? maxBinsBelow;
