@@ -109,13 +109,14 @@ export const config = {
   management: {
     minClaimAmount:        u.minClaimAmount        ?? 5,
     autoSwapAfterClaim:    u.autoSwapAfterClaim    ?? false,
+    notifSuppress:         u.notifSuppress         ?? false,   // only notify deploy/close/swap/briefing
     autoSwapRetryAttempts: u.autoSwapRetryAttempts ?? 3,     // retries for base→SOL auto-swap on Jupiter failure
     autoSwapRetryDelayMs:  u.autoSwapRetryDelayMs  ?? 3000,  // delay between auto-swap retries
     autoSwapSettleDelayMs: u.autoSwapSettleDelayMs ?? 8000,  // wait before first balance check (let token account settle)
     outOfRangeBinsToClose: u.outOfRangeBinsToClose ?? 10,
     outOfRangeWaitMinutes: u.outOfRangeWaitMinutes ?? 30,
     // Hold OOR position if PnL >= this threshold (0 = disabled)
-    oorHoldIfGreenPct: u.oorHoldIfGreenPct ?? 0,
+    oorProfitHoldMinPct: u.oorProfitHoldMinPct ?? 0,
     oorCooldownTriggerCount: u.oorCooldownTriggerCount ?? 3,
     oorCooldownHours:       u.oorCooldownHours       ?? 12,
     repeatDeployCooldownEnabled: u.repeatDeployCooldownEnabled ?? true,
@@ -343,6 +344,7 @@ export function reloadScreeningThresholds() {
     if (fresh.maxCloseSwapPriceImpactPct != null) s.maxCloseSwapPriceImpactPct = fresh.maxCloseSwapPriceImpactPct;
     if (fresh.closeSwapDustUsd != null) s.closeSwapDustUsd = fresh.closeSwapDustUsd;
     if (fresh.closeSwapToleranceBps != null) s.closeSwapToleranceBps = fresh.closeSwapToleranceBps;
+    if (fresh.notifSuppress !== undefined) config.management.notifSuppress = fresh.notifSuppress;
     const minBinsBelow = numericConfig(fresh.minBinsBelow) ?? config.strategy.minBinsBelow;
     const maxBinsBelow = numericConfig(fresh.maxBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.maxBinsBelow;
     const defaultBinsBelow = numericConfig(fresh.defaultBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.defaultBinsBelow ?? maxBinsBelow;

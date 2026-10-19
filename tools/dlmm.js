@@ -26,7 +26,7 @@ import {
 } from "../state.js";
 import { recordPerformance } from "../lessons.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
-import { swapBackWithdrawnBase, expectedBaseWithdrawRaw, expectedClaimFeeRaw } from "./close-swap.js";
+import { swapBackWithdrawnBase, expectedBaseWithdrawRaw, expectedClaimFeeRaw, getPnlTokenBalance } from "./close-swap.js";
 import { getOnchainTokenBalance, getTokenUsdPrice, normalizeMint } from "./wallet.js";
 import { appendDecision } from "../decision-log.js";
 import { agentMeridianJson, getAgentIdForRequests, getAgentMeridianHeaders } from "./agent-meridian.js";
@@ -1138,6 +1138,54 @@ async function fetchRawOpenPositionsFromMeridian({ walletAddress, agentId }) {
   };
 }
 
+/**
+ * Handle post-close swap-back for positions auto-closed by state sync.
+ * State sync marks positions closed when they're missing from on-chain data,
+ * but the closePosition tool's delta-swap never ran, so the withdrawn base
+ * token is orphaned. This attempts to swap it back to SOL and records a
+ * close exposure so the swap_token guard can authorize a manual sale.
+ * Fire-and-forget: callers must attach .catch().
+ */
+async function processSyncedCloseSwaps(closedPositions) {
+  for (const pos of closedPositions) {
+    try {
+      const baseMint = pos.base_mint;
+      if (!baseMint) continue;
+
+      // Best-effort pre-close balance: we don't have a true pre-close snapshot,
+      // so read current balance and treat any balance of this mint as withdrawn.
+      const bal = await getPnlTokenBalance(baseMint) ?? await getOnchainTokenBalance(baseMint);
+      if (bal.raw <= 0n) continue;
+
+      // Record exposure so swap_token guard authorizes selling this mint.
+      recordCloseExposure({
+        position: pos.position,
+        mint: baseMint,
+        preRaw: 0n,
+        decimals: bal.decimals,
+        unsoldRaw: bal.raw,
+        ambiguousUntil: null,
+      });
+
+      // Attempt automatic swap-back of the withdrawn base token.
+      const swapResult = await swapBackWithdrawnBase({
+        baseMint,
+        symbol: pos.pool_name?.split("/")[0] || baseMint.slice(0, 8),
+        preRaw: 0n,
+        expectedRaw: null,
+      });
+
+      if (swapResult.swapOutcome?.success) {
+        log("close", `State-sync close: swapped ${baseMint.slice(0, 8)} back to SOL`);
+      } else {
+        log("close_warn", `State-sync close: swap-back not possible for ${baseMint.slice(0, 8)} (no pre-close snapshot); exposure recorded for manual swap_token`);
+      }
+    } catch (e) {
+      log("close_warn", `State-sync close swap-back error for ${pos.position}: ${e.message}`);
+    }
+  }
+}
+
 // ─── Get My Positions ──────────────────────────────────────────
 export async function getMyPositions({ force = false, silent = false, wallet_address = null } = {}) {
   let walletOverride = null;
@@ -1169,7 +1217,8 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
         if (!silent) log("positions", `Computing PnL from RPC (${config.pnl.rpcUrl})...`);
         const rpcResult = await computePositions(walletAddress);
         if (useLocalWallet) {
-          syncOpenPositions(rpcResult.positions.map((p) => p.position));
+          const closed = syncOpenPositions(rpcResult.positions.map((p) => p.position));
+          processSyncedCloseSwaps(closed).catch(e => log("close_warn", `Synced close swap error (RPC path): ${e.message}`));
           _positionsCache = rpcResult;
           _positionsCacheAt = Date.now();
         }
@@ -1340,7 +1389,8 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
       source: "meteora",
     };
     if (useLocalWallet) {
-      syncOpenPositions(positions.map(p => p.position));
+      const closed = syncOpenPositions(positions.map(p => p.position));
+      processSyncedCloseSwaps(closed).catch(e => log("close_warn", `Synced close swap error (Meteora path): ${e.message}`));
       _positionsCache = result;
       _positionsCacheAt = Date.now();
     }
@@ -1520,7 +1570,7 @@ export async function closePosition({ position_address, reason }) {
       let preRaw = null;
       let expectedRaw = null;
       try {
-        const bal = await getOnchainTokenBalance(baseMint);
+        const bal = await getPnlTokenBalance(baseMint) ?? await getOnchainTokenBalance(baseMint);
         preRaw = bal.raw;
         const positionDataForExpected = await pool.getPosition(new PublicKey(position_address));
         expectedRaw = expectedBaseWithdrawRaw(pool, positionDataForExpected, baseMint);
@@ -1644,7 +1694,14 @@ export async function closePosition({ position_address, reason }) {
           log("close", `Post-close swap txs added: ${swapResult.txs.join(", ")}`);
         }
         if (exposureFlag) {
-          recordCloseExposure(position_address, swapResult.exposure);
+          recordCloseExposure({
+            position: position_address,
+            mint: swapResult.exposure.mint,
+            preRaw: swapResult.exposure.pre_raw != null ? BigInt(swapResult.exposure.pre_raw) : 0n,
+            decimals: swapResult.exposure.decimals,
+            unsoldRaw: swapResult.exposure.unsold_raw != null ? BigInt(swapResult.exposure.unsold_raw) : 0n,
+            ambiguousUntil: swapResult.exposure.ambiguous ? new Date(Date.now() + 30 * 60 * 1000).toISOString() : null,
+          });
           log("close_warn", `Post-close swap left exposure for ${baseMint}: ${swapResult.exposure.unsold_raw} raw unsold`);
         }
       } catch (e) {
@@ -1773,6 +1830,7 @@ export async function closePosition({ position_address, reason }) {
           auto_swapped: autoSwapped,
           swap_outcome: swapOutcome,
           exposure: exposureFlag ? "success_with_exposure" : null,
+          reason: reason || "agent decision",
         };
       }
 
@@ -1801,6 +1859,7 @@ export async function closePosition({ position_address, reason }) {
         auto_swapped: autoSwapped,
         swap_outcome: swapOutcome,
         exposure: exposureFlag ? "success_with_exposure" : null,
+        reason: reason || "agent decision",
       };
       } catch (relayError) {
         if (relaySubmitted) throw relayError;
@@ -1817,7 +1876,7 @@ export async function closePosition({ position_address, reason }) {
     let preRaw = null;
     let expectedRaw = null;
     try {
-      const bal = await getOnchainTokenBalance(baseMint);
+      const bal = await getPnlTokenBalance(baseMint) ?? await getOnchainTokenBalance(baseMint);
       preRaw = bal.raw;
       // Compute expected withdrawal from position data before it's closed
       const positionDataForExpected = await pool.getPosition(new PublicKey(position_address));
@@ -1836,7 +1895,7 @@ export async function closePosition({ position_address, reason }) {
     let preCloseRaw = null;
     let preCloseDecimals = null;
     try {
-      const preBal = await getOnchainTokenBalance(closeBaseMint);
+      const preBal = await getPnlTokenBalance(closeBaseMint) ?? await getOnchainTokenBalance(closeBaseMint);
       preCloseRaw = preBal.raw;
       preCloseDecimals = preBal.decimals;
       log("close", `Pre-close ${closeBaseMint.slice(0, 8)} balance: ${preBal.ui}`);
@@ -1964,7 +2023,14 @@ export async function closePosition({ position_address, reason }) {
         log("close", `Post-close swap txs added: ${swapResult.txs.join(", ")}`);
       }
       if (exposureFlag) {
-        recordCloseExposure(position_address, swapResult.exposure);
+        recordCloseExposure({
+          position: position_address,
+          mint: swapResult.exposure.mint,
+          preRaw: swapResult.exposure.pre_raw != null ? BigInt(swapResult.exposure.pre_raw) : 0n,
+          decimals: swapResult.exposure.decimals,
+          unsoldRaw: swapResult.exposure.unsold_raw != null ? BigInt(swapResult.exposure.unsold_raw) : 0n,
+          ambiguousUntil: swapResult.exposure.ambiguous ? new Date(Date.now() + 30 * 60 * 1000).toISOString() : null,
+        });
         log("close_warn", `Post-close swap left exposure for ${baseMint}: ${swapResult.exposure.unsold_raw} raw unsold`);
       }
     } catch (e) {
@@ -2136,6 +2202,7 @@ export async function closePosition({ position_address, reason }) {
         swap_outcome: swapOutcome,
         exposure: exposureFlag ? "success_with_exposure" : null,
         auto_swapped: !exposureFlag && swapOutcome?.success,
+        reason: reason || "agent decision",
       };
     }
 
@@ -2162,6 +2229,7 @@ export async function closePosition({ position_address, reason }) {
       auto_swapped: autoSwapped,
       swap_outcome: swapOutcome,
       exposure: exposureFlag ? "success_with_exposure" : null,
+      reason: reason || "agent decision",
     };
   } catch (error) {
     log("close_error", error.message);

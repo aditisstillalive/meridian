@@ -23,10 +23,59 @@
  *   could sell twice.
  */
 import { log as defaultLog } from "../logger.js";
-import { getOnchainTokenBalance, getTokenUsdPrice, swapToken } from "./wallet.js";
+import { getOnchainTokenBalance, getTokenUsdPrice, swapToken, getWallet } from "./wallet.js";
 import { config } from "../config.js";
+import { Connection, PublicKey } from "@solana/web3.js";
 
 const SOL_MINT = "So11111111111111111111111111111111111111112";
+
+// Separate connection for balance polling using pnlRpcUrl (faster indexing)
+// Falls back to main RPC (via getOnchainTokenBalance) on error/timeout.
+let _pnlConnection = null;
+export function getPnlConnection() {
+  if (!_pnlConnection && config.pnl?.rpcUrl) {
+    _pnlConnection = new Connection(config.pnl.rpcUrl, { commitment: "confirmed" });
+  }
+  return _pnlConnection;
+}
+
+const PNL_RPC_TIMEOUT_MS = 5000;
+
+export async function getPnlTokenBalance(mint) {
+  const conn = getPnlConnection();
+  if (!conn) return null;
+  const walletKp = getWallet();
+  const mintPk = new PublicKey(mint);
+
+  // Try pnlRpcUrl first with timeout
+  try {
+    const accounts = await Promise.race([
+      conn.getParsedTokenAccountsByOwner(walletKp.publicKey, { mint: mintPk }, { commitment: "confirmed" }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("pnlRpcUrl timeout")), PNL_RPC_TIMEOUT_MS)),
+    ]);
+    if (!accounts.value?.length) return { raw: 0n, decimals: 0, ui: "0" };
+    let totalRaw = 0n;
+    let decimals = 9;
+    for (const { account } of accounts.value) {
+      const info = account?.data?.parsed?.info;
+      const amt = info?.tokenAmount;
+      if (!info?.mint || amt?.amount == null || !/^\d+$/.test(String(amt.amount))) continue;
+      totalRaw += BigInt(amt.amount);
+      if (decimals === 9 && Number.isInteger(amt.decimals)) decimals = amt.decimals;
+    }
+    const ui = decimals === 0 ? totalRaw.toString() : (Number(totalRaw / 10n ** BigInt(decimals))).toFixed(decimals).replace(/\.?0+$/, "");
+    return { raw: totalRaw, decimals, ui };
+  } catch (e) {
+    log("wallet_warn", `getPnlTokenBalance ${mint} pnlRpc failed (${e.message}); falling back to main RPC`);
+    // Fallback to main RPC via getOnchainTokenBalance
+    try {
+      return await getOnchainTokenBalance(mint);
+    } catch (e2) {
+      log("wallet_error", `getPnlTokenBalance ${mint} fallback failed: ${e2.message}`);
+      return { raw: 0n, decimals: 0, ui: "0" };
+    }
+  }
+}
 
 function getDustUsd() {
   return Number(config.management.closeSwapDustUsd ?? 0.05);
@@ -113,7 +162,8 @@ export function expectedBaseWithdrawRaw(pool, positionData, baseMint) {
  * @returns {Promise<{ swapOutcome: object|null, exposureFlag: boolean, txs: string[] }>}
  */
 export async function swapBackWithdrawnBase({ baseMint, symbol = null, preRaw, expectedRaw = null }, deps = {}) {
-  const readBalance = deps.readBalance ?? getOnchainTokenBalance;
+  // Use pnlRpcUrl for faster balance indexing; fall back to main RPC
+  const readBalance = deps.readBalance ?? getPnlTokenBalance ?? getOnchainTokenBalance;
   const getPrice = deps.getPrice ?? getTokenUsdPrice;
   const swap = deps.swap ?? swapToken;
   const sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));

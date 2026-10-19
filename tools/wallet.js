@@ -17,7 +17,7 @@ function getConnection() {
   return _connection;
 }
 
-function getWallet() {
+export function getWallet() {
   if (!_wallet) {
     if (!process.env.WALLET_PRIVATE_KEY) throw new Error("WALLET_PRIVATE_KEY not set");
     _wallet = Keypair.fromSecretKey(bs58.decode(process.env.WALLET_PRIVATE_KEY));
@@ -270,19 +270,17 @@ export async function getOnchainTokenBalance(mint) {
   const mintPk = new PublicKey(mint);
 
   try {
-    const accounts = await connection.getTokenAccountsByOwner(wallet.publicKey, { mint: mintPk }, "confirmed");
-    if (!accounts.value.length) return { raw: 0n, decimals: 0, ui: "0" };
+    const accounts = await connection.getParsedTokenAccountsByOwner(wallet.publicKey, { mint: mintPk }, { commitment: "confirmed" });
+    if (!accounts.value?.length) return { raw: 0n, decimals: 0, ui: "0" };
     // Sum all token accounts for this mint (should be 1 in practice)
     let totalRaw = 0n;
     let decimals = 9;
-    for (const acc of accounts.value) {
-      const parsed = acc.account.data?.parsed;
-      if (!parsed || !parsed.info) continue;
-      const info = parsed.info;
-      const amount = info.tokenAmount?.amount;
-      if (amount == null) continue;
-      totalRaw += BigInt(amount);
-      decimals = info.tokenAmount?.decimals ?? 9;
+    for (const { account } of accounts.value) {
+      const info = account?.data?.parsed?.info;
+      const amt = info?.tokenAmount;
+      if (!info?.mint || amt?.amount == null || !/^\d+$/.test(String(amt.amount))) continue;
+      totalRaw += BigInt(amt.amount);
+      if (decimals === 9 && Number.isInteger(amt.decimals)) decimals = amt.decimals;
     }
     const ui = decimals === 0 ? totalRaw.toString() : (Number(totalRaw / 10n ** BigInt(decimals))).toFixed(decimals).replace(/\.?0+$/, "");
     return { raw: totalRaw, decimals, ui };

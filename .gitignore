@@ -48,3 +48,7 @@ failover-state.json
 
 # Claude Code runtime lock
 .claude/scheduled_tasks.lock
+
+# API key rotator stuff
+helius_api_key.txt
+scripts/update-helius-key.sh

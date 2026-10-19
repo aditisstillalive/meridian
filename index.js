@@ -237,13 +237,14 @@ export async function runManagementCycle({ silent = false } = {}) {
   _managementBusy = true;
   timers.managementLastRun = Date.now();
   log("cron", "Starting management cycle");
+  log("cron", `notifSuppress=${config.management.notifSuppress}, silent=${silent}, telegramEnabled=${telegramEnabled()}`);
   let mgmtReport = null;
   let positions = [];
   let liveMessage = null;
   const screeningCooldownMs = 5 * 60 * 1000;
 
   try {
-    if (!silent && telegramEnabled()) {
+    if (!silent && telegramEnabled() && !config.management.notifSuppress) {
       liveMessage = await createLiveMessage("🔄 Management Cycle", "Evaluating positions...");
     }
     const livePositions = await getMyPositions({ force: true }).catch(() => null);
@@ -341,7 +342,9 @@ export async function runManagementCycle({ silent = false } = {}) {
       if (execReport) mgmtReport += `\n\n${execReport}`;
     } else {
       log("cron", "Management: all positions STAY — skipping");
-      await liveMessage?.note("No tool actions needed.");
+      if (!config.management.notifSuppress) {
+        await liveMessage?.note("No tool actions needed.");
+      }
     }
 
     // Trigger screening after management
@@ -356,7 +359,7 @@ export async function runManagementCycle({ silent = false } = {}) {
     mgmtReport = `Management cycle failed: ${error.message}`;
   } finally {
     _managementBusy = false;
-    if (!silent && telegramEnabled()) {
+    if (!silent && telegramEnabled() && !config.management.notifSuppress) {
       if (mgmtReport) {
         if (liveMessage) await liveMessage.finalize(stripThink(mgmtReport)).catch(() => {});
         else sendMessage(`🔄 Management Cycle\n\n${stripThink(mgmtReport)}`).catch(() => { });
@@ -417,7 +420,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     _screeningBusy = false;
     return screenReport;
   }
-  if (!silent && telegramEnabled()) {
+  if (!silent && telegramEnabled() && !config.management.notifSuppress) {
     liveMessage = await createLiveMessage("🔍 Screening Cycle", "Scanning candidates...");
   }
   timers.screeningLastRun = Date.now();
@@ -682,7 +685,7 @@ IMPORTANT:
     screenReport = `Screening cycle failed: ${error.message}`;
   } finally {
     _screeningBusy = false;
-    if (!silent && telegramEnabled()) {
+    if (!silent && telegramEnabled() && !config.management.notifSuppress) {
       if (screenReport) {
         if (liveMessage) await liveMessage.finalize(stripThink(screenReport)).catch(() => {});
         else sendMessage(`🔍 Screening Cycle\n\n${stripThink(screenReport)}`).catch(() => { });
@@ -965,7 +968,7 @@ function getDeterministicCloseRule(position, managementConfig) {
     position.active_bin > position.upper_bin &&
     (position.minutes_out_of_range ?? 0) >= managementConfig.outOfRangeWaitMinutes
   ) {
-    const holdThresh = managementConfig.oorHoldIfGreenPct ?? 0;
+    const holdThresh = managementConfig.oorProfitHoldMinPct ?? 0;
     if (holdThresh > 0 && position.pnl_pct != null && position.pnl_pct >= holdThresh) {
       return null; // hold profitable OOR position
     }

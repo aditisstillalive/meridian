@@ -464,6 +464,7 @@ const SYNC_GRACE_MS = 5 * 60_000; // don't auto-close positions deployed < 5 min
 export function syncOpenPositions(active_addresses) {
   const state = load();
   const activeSet = new Set(active_addresses);
+  const closed = [];
   let changed = false;
 
   for (const posId in state.positions) {
@@ -480,11 +481,20 @@ export function syncOpenPositions(active_addresses) {
     pos.closed = true;
     pos.closed_at = new Date().toISOString();
     pos.notes.push(`Auto-closed during state sync (not found on-chain)`);
+    closed.push({
+      position: posId,
+      pool: pos.pool,
+      pool_name: pos.pool_name,
+      base_mint: pos.signal_snapshot?.base_mint,
+      strategy: pos.strategy,
+      amount_sol: pos.amount_sol,
+    });
     changed = true;
     log("state", `Position ${posId} auto-closed (missing from on-chain data)`);
   }
 
   if (changed) save(state);
+  return closed;
 }
 
 /**

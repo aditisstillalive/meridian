@@ -46,6 +46,7 @@
 
   "minClaimAmount": 5,
   "autoSwapAfterClaim": false,
+  "notifSuppress": false,
   "outOfRangeBinsToClose": 10,
   "outOfRangeWaitMinutes": 30,
   "oorCooldownTriggerCount": 3,

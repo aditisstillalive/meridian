@@ -213,6 +213,7 @@ function normalizeConfigValue(key, value) {
     "avoidPvpSymbols",
     "blockPvpSymbols",
     "autoSwapAfterClaim",
+    "notifSuppress",
     "trailingTakeProfit",
     "solMode",
     "darwinEnabled",
@@ -378,12 +379,13 @@ const toolMap = {
       // management
       minClaimAmount: ["management", "minClaimAmount"],
       autoSwapAfterClaim: ["management", "autoSwapAfterClaim"],
+      notifSuppress: ["management", "notifSuppress"],
       autoSwapRetryAttempts: ["management", "autoSwapRetryAttempts"],
       autoSwapRetryDelayMs: ["management", "autoSwapRetryDelayMs"],
       autoSwapSettleDelayMs: ["management", "autoSwapSettleDelayMs"],
       outOfRangeBinsToClose: ["management", "outOfRangeBinsToClose"],
       outOfRangeWaitMinutes: ["management", "outOfRangeWaitMinutes"],
-      oorHoldIfGreenPct: ["management", "oorHoldIfGreenPct"],
+      oorProfitHoldMinPct: ["management", "oorProfitHoldMinPct"],
       oorCooldownTriggerCount: ["management", "oorCooldownTriggerCount"],
       oorCooldownHours: ["management", "oorCooldownHours"],
       repeatDeployCooldownEnabled: ["management", "repeatDeployCooldownEnabled"],
@@ -656,7 +658,7 @@ export async function executeTool(name, args) {
       } else if (name === "deploy_position") {
         notifyDeploy({ pair: result.pool_name || args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, position: result.position, tx: result.txs?.[0] ?? result.tx, priceRange: result.price_range, rangeCoverage: result.range_coverage, binStep: result.bin_step, baseFee: result.base_fee }).catch(() => {});
       } else if (name === "close_position") {
-        notifyClose({ pair: result.pool_name || args.position_address?.slice(0, 8), pnlUsd: result.pnl_usd ?? 0, pnlPct: result.pnl_pct ?? 0 }).catch(() => {});
+        notifyClose({ pair: result.pool_name || args.position_address?.slice(0, 8), pnlUsd: result.pnl_usd ?? 0, pnlPct: result.pnl_pct ?? 0, reason: result.reason }).catch(() => {});
         // Note low-yield closes in pool memory so screener avoids redeploying
         if (args.reason && args.reason.toLowerCase().includes("yield")) {
           const poolAddr = result.pool || args.pool_address;
@@ -823,16 +825,35 @@ async function runSafetyChecks(name, args) {
         };
       }
 
-      // Check SOL balance
+      // Check SOL balance — include position rent + tx fees overhead
       if (process.env.DRY_RUN !== "true") {
-        const balance = await getWalletBalances();
-        const gasReserve = config.management.gasReserve;
-        const minRequired = amountY + gasReserve;
+        const balance = await getWalletBalances({ fresh: true });
+        const gasReserve = config.management.gasReserve ?? 0.2;
+        // Position rent scales with bin count; worst-case for max bins (69) at min bin_step (80)
+        const requestedBinsBelow = Number(args.bins_below ?? config.strategy.defaultBinsBelow ?? config.strategy.minBinsBelow ?? 69);
+        const requestedBinsAbove = Number(args.bins_above ?? 0);
+        const totalBins = requestedBinsBelow + requestedBinsAbove;
+        const POSITION_RENT_BASE_SOL = 0.0574;
+        const POSITION_RENT_PER_EXTRA_BIN_SOL = 0.00041;
+        const DEPLOY_TX_FEES_SOL = 0.01;
+        const positionRent = POSITION_RENT_BASE_SOL + POSITION_RENT_PER_EXTRA_BIN_SOL * Math.max(0, totalBins - 70);
+        const overhead = positionRent + DEPLOY_TX_FEES_SOL;
+        const minRequired = amountY + gasReserve + overhead;
         if (balance.sol < minRequired) {
           return {
             pass: false,
-            reason: `Insufficient SOL: have ${balance.sol} SOL, need ${minRequired} SOL (${amountY} deploy + ${gasReserve} gas reserve).`,
+            reason: `Insufficient SOL: have ${balance.sol.toFixed(4)} SOL, need ${minRequired.toFixed(4)} SOL (${amountY} deploy + ${gasReserve} gas + ${overhead.toFixed(4)} rent/fees).`,
           };
+        }
+        // Optional: fit amount if slightly over (shrink to leave gas reserve intact)
+        if (balance.sol < minRequired + 0.01 && balance.sol > minRequired * 0.95) {
+          const available = balance.sol - gasReserve - overhead;
+          const fitted = Math.floor(Math.max(0, available) * 100) / 100;
+          if (fitted > 0 && fitted < amountY) {
+            args.amount_y = args.amount_sol = fitted;
+            amountY = fitted;
+            log("deploy", `Fitted deploy amount to ${fitted} SOL to preserve gas reserve (balance ${balance.sol.toFixed(4)} SOL)`);
+          }
         }
       }
 

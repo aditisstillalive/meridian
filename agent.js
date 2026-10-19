@@ -260,7 +260,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
       // Keep tool-call history API-valid, but never execute unrecoverable args.
       if (msg.tool_calls) {
         for (const tc of msg.tool_calls) {
-          if (tc.function?.arguments) {
+          if (tc.function?.arguments != null && tc.function.arguments !== "") {
             try {
               JSON.parse(tc.function.arguments);
             } catch {
