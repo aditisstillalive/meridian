@@ -40,6 +40,8 @@ function load() {
   }
 }
 
+export { load };
+
 function save(state) {
   try {
     state.lastUpdated = new Date().toISOString();
@@ -104,6 +106,8 @@ export function trackPosition({
     closed_at: null,
     notes: [],
     peak_pnl_pct: 0,
+    min_pnl_pct: 0,
+    max_drawdown_pct: 0,
     pending_peak_pnl_pct: null,
     pending_peak_confirm_count: 0,
     pending_peak_started_at: null,
@@ -364,6 +368,16 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
 
   let changed = false;
 
+  // Track peak and drawdown
+  if (currentPnlPct != null) {
+    const oldPeak = pos.peak_pnl_pct ?? 0;
+    const oldMin = pos.min_pnl_pct ?? 0;
+    pos.peak_pnl_pct = Math.max(oldPeak, currentPnlPct);
+    pos.min_pnl_pct = Math.min(oldMin, currentPnlPct);
+    pos.max_drawdown_pct = Math.max(0, pos.peak_pnl_pct - pos.min_pnl_pct);
+    changed = true;
+  }
+
   // Activate trailing TP once trigger threshold is reached
   if (mgmtConfig.trailingTakeProfit && !pos.trailing_active && (pos.peak_pnl_pct ?? 0) >= mgmtConfig.trailingTriggerPct) {
     pos.trailing_active = true;
@@ -408,13 +422,17 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   }
 
   // ── Out of range too long ──────────────────────────────────────
+  let oorExit = null;
   if (pos.out_of_range_since) {
     const minutesOOR = Math.floor((Date.now() - new Date(pos.out_of_range_since).getTime()) / 60000);
     if (minutesOOR >= mgmtConfig.outOfRangeWaitMinutes) {
-      return {
-        action: "OUT_OF_RANGE",
-        reason: `Out of range for ${minutesOOR}m (limit: ${mgmtConfig.outOfRangeWaitMinutes}m)`,
-      };
+      const holdThresh = mgmtConfig.oorProfitHoldMinPct ?? 0;
+      if (!(holdThresh > 0 && currentPnlPct != null && currentPnlPct >= holdThresh)) {
+        oorExit = {
+          action: "OUT_OF_RANGE",
+          reason: `Out of range for ${minutesOOR}m (limit: ${mgmtConfig.outOfRangeWaitMinutes}m)`,
+        };
+      }
     }
   }
 
@@ -432,6 +450,8 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
       reason: `Low yield: fee/TVL ${fee_per_tvl_24h.toFixed(2)}% < min ${mgmtConfig.minFeePerTvl24h}% (age: ${age_minutes ?? "?"}m)`,
     };
   }
+
+  if (oorExit) return oorExit;
 
   return null;
 }

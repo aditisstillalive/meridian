@@ -8,6 +8,9 @@ import {
 import bs58 from "bs58";
 import { log } from "../logger.js";
 import { config } from "../config.js";
+import { walletCacheState, invalidateWalletBalances, WALLET_BALANCES_TTL_MS } from "./wallet-cache.js";
+
+export { invalidateWalletBalances };
 
 let _connection = null;
 let _wallet = null;
@@ -52,85 +55,279 @@ function getJupiterReferralParams() {
   return { referralAccount, referralFee: Math.round(referralFee) };
 }
 
+// ─── RPC-based wallet balances (no Helius Wallet API) ─────────────
+// The Helius Wallet API costs 100 credits per call and was ~97% of the plan's
+// spend. Balances now come from 3 RPC calls (getBalance + parsed token accounts
+// for Token and Token-2022), prices from Jupiter Price v3 and symbols from
+// Jupiter Tokens v2. USE_HELIUS_WALLET_API=true restores the old source.
+
+const TOKEN_PROGRAM_IDS = [
+  "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", // SPL Token
+  "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb", // Token-2022
+];
+const PRICE_BATCH = 50; // Jupiter Price v3 max ids per request
+export const SOL_PRICE_TTL_MS = 60_000;
+
+const SOL_MINT = "So11111111111111111111111111111111111111112";
+
+let _solPrice = null; // { at, price }
+let _solPriceInflight = null;
+const _symbols = new Map(); // mint -> symbol | null
+let _testDeps = null;
+
+/** Connection for balance reads from BALANCE_RPC_URL, or null when unset. */
+function getBalanceConnection() {
+  const url = process.env.BALANCE_RPC_URL;
+  if (!url) return null;
+  if (!_balanceConnection) _balanceConnection = new Connection(url, "confirmed");
+  return _balanceConnection;
+}
+let _balanceConnection = null;
+
+async function readHoldings(connection, owner) {
+  const [lamports, ...tokenResults] = await Promise.all([
+    connection.getBalance(owner, "confirmed"),
+    ...TOKEN_PROGRAM_IDS.map((programId) =>
+      connection.getParsedTokenAccountsByOwner(owner, { programId: new PublicKey(programId) }, "confirmed")),
+  ]);
+  if (lamports == null || !Number.isFinite(Number(lamports))) throw new Error("getBalance returned no value");
+  const byMint = new Map(); // mint -> { raw: bigint, decimals }
+  for (const res of tokenResults) {
+    if (!res || !Array.isArray(res.value)) throw new Error("getParsedTokenAccountsByOwner returned no value");
+    for (const { account } of res.value) {
+      const info = account?.data?.parsed?.info;
+      const amt = info?.tokenAmount;
+      if (!info?.mint || amt?.amount == null || !/^\d+$/.test(String(amt.amount))) continue;
+      const cur = byMint.get(info.mint) ?? { raw: 0n, decimals: Number.isInteger(amt.decimals) ? amt.decimals : 0 };
+      cur.raw += BigInt(amt.amount);
+      byMint.set(info.mint, cur);
+    }
+  }
+  return { lamports: Number(lamports), byMint };
+}
+
+async function readHoldingsRouted(owner) {
+  const balanceConn = getBalanceConnection();
+  const mainConn = getConnection();
+  if (!balanceConn) return readHoldings(mainConn, owner);
+  try {
+    return await readHoldings(balanceConn, owner);
+  } catch (e) {
+    log("wallet_warn", `Balance RPC failed (${e.message}); retrying on the main RPC`);
+    return readHoldings(mainConn, owner);
+  }
+}
+
+async function fetchJupiterPrices(mints) {
+  const out = new Map();
+  const ids = [...new Set(mints.filter(Boolean))];
+  for (let i = 0; i < ids.length; i += PRICE_BATCH) {
+    const chunk = ids.slice(i, i + PRICE_BATCH);
+    try {
+      const res = await fetch(`${JUPITER_PRICE_API}?ids=${chunk.join(",")}`, {
+        headers: { "x-api-key": getJupiterApiKey() },
+      });
+      if (!res.ok) {
+        log("wallet_warn", `Jupiter price request failed: HTTP ${res.status}`);
+        continue;
+      }
+      const body = await res.json();
+      for (const m of chunk) {
+        const p = Number(body?.[m]?.usdPrice);
+        if (Number.isFinite(p) && p > 0) out.set(m, p);
+      }
+    } catch (e) {
+      log("wallet_warn", `Jupiter price request failed: ${e.message}`);
+    }
+  }
+  if (out.has(SOL_MINT)) _solPrice = { at: Date.now(), price: out.get(SOL_MINT) };
+  return out;
+}
+
+export async function getSolPrice() {
+  if (_solPrice && Date.now() - _solPrice.at < SOL_PRICE_TTL_MS) return _solPrice.price;
+  if (_solPriceInflight) return _solPriceInflight;
+  const p = fetchJupiterPrices([SOL_MINT])
+    .then((prices) => prices.get(SOL_MINT) ?? _solPrice?.price ?? 0)
+    .finally(() => { if (_solPriceInflight === p) _solPriceInflight = null; });
+  _solPriceInflight = p;
+  return p;
+}
+
+async function resolveSymbols(mints) {
+  const need = mints.filter((m) => !_symbols.has(m));
+  if (need.length) {
+    try {
+      const res = await fetch(`https://api.jup.ag/tokens/v2/mint?ids=${need.join(",")}`, {
+        headers: { "x-api-key": getJupiterApiKey() },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        for (const m of need) _symbols.set(m, data?.[m]?.symbol || null);
+      }
+    } catch { /* fall back to mint prefix */ }
+  }
+  return (m) => _symbols.get(m) || m.slice(0, 8);
+}
+
+const round2 = (n) => Math.round(n * 100) / 100;
+
+async function readWalletBalances(walletAddress) {
+  const { lamports, byMint } = await readHoldingsRouted(new PublicKey(walletAddress));
+  const held = [...byMint.entries()].filter(([, v]) => v.raw > 0n);
+  const mints = held.map(([m]) => m);
+  const [prices, symbolOf] = await Promise.all([
+    fetchJupiterPrices([SOL_MINT, ...mints]),
+    resolveSymbols(mints),
+  ]);
+
+  const solPrice = prices.get(SOL_MINT) ?? _solPrice?.price ?? 0;
+  const sol = lamports / LAMPORTS_PER_SOL;
+  const solUsd = sol * solPrice;
+  const tokens = [{ mint: SOL_MINT, symbol: "SOL", balance: sol, usd: solPrice > 0 ? round2(solUsd) : null }];
+  let totalUsd = solUsd;
+  let usdc = 0;
+  for (const [mint, { raw, decimals }] of held) {
+    const balance = Number(raw) / 10 ** decimals;
+    const price = prices.get(mint);
+    const usd = price != null ? balance * price : null;
+    if (usd != null) totalUsd += usd;
+    if (mint === config.USDC) usdc = balance;
+    tokens.push({
+      mint,
+      symbol: mint === SOL_MINT ? "WSOL" : symbolOf(mint),
+      balance,
+      usd: usd == null ? null : round2(usd),
+    });
+  }
+
+  return {
+    wallet: walletAddress,
+    sol: Math.round(sol * 1e6) / 1e6,
+    sol_price: round2(solPrice),
+    sol_usd: round2(solUsd),
+    usdc: round2(usdc),
+    tokens,
+    total_usd: round2(totalUsd),
+  };
+}
+
+/** Legacy source (opt-in via USE_HELIUS_WALLET_API=true): 100 credits/call. */
+async function readHeliusWalletBalances(walletAddress) {
+  const HELIUS_KEY = process.env.HELIUS_API_KEY;
+  if (!HELIUS_KEY) throw new Error("Helius API key missing");
+  const res = await fetch(`https://api.helius.xyz/v1/wallet/${walletAddress}/balances?api-key=${HELIUS_KEY}`);
+  if (!res.ok) throw new Error(`Helius API error: ${res.status} ${res.statusText}`);
+  const data = await res.json();
+  const balances = data.balances || [];
+  const solEntry = balances.find((b) => b.mint === config.SOL || b.symbol === "SOL");
+  const usdcEntry = balances.find((b) => b.mint === config.USDC || b.symbol === "USDC");
+  if (solEntry?.pricePerToken > 0) _solPrice = { at: Date.now(), price: solEntry.pricePerToken };
+  return {
+    wallet: walletAddress,
+    sol: Math.round((solEntry?.balance || 0) * 1e6) / 1e6,
+    sol_price: round2(solEntry?.pricePerToken || 0),
+    sol_usd: round2(solEntry?.usdValue || 0),
+    usdc: round2(usdcEntry?.balance || 0),
+    tokens: balances.map((b) => ({
+      mint: b.mint,
+      symbol: b.symbol || b.mint.slice(0, 8),
+      balance: b.balance,
+      usd: b.usdValue ? round2(b.usdValue) : null,
+    })),
+    total_usd: round2(data.totalUsdValue || 0),
+  };
+}
+
+const emptyBalances = (wallet, error) => ({ wallet, sol: 0, sol_price: 0, sol_usd: 0, usdc: 0, tokens: [], total_usd: 0, error });
+
 /**
- * Get current wallet balances: SOL, USDC, and all SPL tokens using Helius Wallet API.
- * Returns USD-denominated values provided by Helius.
+ * Wallet balances: { wallet, sol, sol_price, sol_usd, usdc,
+ * tokens: [{ mint, symbol, balance, usd }], total_usd } or the same shape with
+ * `error` on failure. Cached for WALLET_BALANCES_TTL_MS (20s); every send
+ * invalidates the cache (tx-send.js, swapToken). Pass { fresh: true } to skip
+ * the cache when the read feeds a decision about moving funds.
  */
-export async function getWalletBalances() {
+export async function getWalletBalances(opts) {
+  const fresh = opts?.fresh === true;
   let walletAddress;
   try {
     walletAddress = getWallet().publicKey.toString();
   } catch {
-    return { wallet: null, sol: 0, sol_price: 0, sol_usd: 0, usdc: 0, tokens: [], total_usd: 0, error: "Wallet not configured" };
+    return emptyBalances(null, "Wallet not configured");
   }
 
-  const HELIUS_KEY = process.env.HELIUS_API_KEY;
-  if (!HELIUS_KEY) {
-    log("wallet_error", "HELIUS_API_KEY not set in .env");
-    return { wallet: walletAddress, sol: 0, sol_price: 0, sol_usd: 0, usdc: 0, tokens: [], total_usd: 0, error: "Helius API key missing" };
-  }
+  const c = walletCacheState();
+  if (!fresh && c.entry && Date.now() - c.entry.at < WALLET_BALANCES_TTL_MS) return structuredClone(c.entry.value);
+  if (!fresh && c.inflight) return c.inflight.then((v) => structuredClone(v));
+
+  const gen = c.generation;
+  const useHelius = process.env.USE_HELIUS_WALLET_API === "true";
+  const p = (useHelius ? readHeliusWalletBalances(walletAddress) : readWalletBalances(walletAddress))
+    .then((value) => {
+      if (c.generation === gen) c.entry = { at: Date.now(), value };
+      return value;
+    })
+    .catch((error) => {
+      log("wallet_error", error.message);
+      return emptyBalances(walletAddress, error.message);
+    })
+    .finally(() => { if (c.inflight === p) c.inflight = null; });
+  if (!fresh) c.inflight = p;
+  return p.then((v) => structuredClone(v));
+}
+
+/**
+ * Read on-chain token balance directly via RPC (confirmed commitment).
+ * Returns { raw: bigint, decimals: number, ui: string }.
+ * Uses `confirmed` commitment to see the latest state after a tx lands.
+ */
+export async function getOnchainTokenBalance(mint) {
+  const connection = getConnection();
+  const wallet = getWallet();
+  const mintPk = new PublicKey(mint);
 
   try {
-    const url = `https://api.helius.xyz/v1/wallet/${walletAddress}/balances?api-key=${HELIUS_KEY}`;
-    const res = await fetch(url);
-
-    if (!res.ok) {
-      throw new Error(`Helius API error: ${res.status} ${res.statusText}`);
+    const accounts = await connection.getParsedTokenAccountsByOwner(wallet.publicKey, { mint: mintPk }, { commitment: "confirmed" });
+    if (!accounts.value?.length) return { raw: 0n, decimals: 0, ui: "0" };
+    let totalRaw = 0n;
+    let decimals = 9;
+    for (const { account } of accounts.value) {
+      const info = account?.data?.parsed?.info;
+      const amt = info?.tokenAmount;
+      if (!info?.mint || amt?.amount == null || !/^\d+$/.test(String(amt.amount))) continue;
+      totalRaw += BigInt(amt.amount);
+      if (decimals === 9 && Number.isInteger(amt.decimals)) decimals = amt.decimals;
     }
-
-    const data = await res.json();
-    const balances = data.balances || [];
-
-    // ─── Find SOL and USDC ────────────────────────────────────
-    const solEntry = balances.find(b => b.mint === config.tokens.SOL || b.symbol === "SOL");
-    const usdcEntry = balances.find(b => b.mint === config.tokens.USDC || b.symbol === "USDC");
-
-    const solBalance = solEntry?.balance || 0;
-    const solPrice = solEntry?.pricePerToken || 0;
-    const solUsd = solEntry?.usdValue || 0;
-    const usdcBalance = usdcEntry?.balance || 0;
-
-    // ─── Map all tokens ───────────────────────────────────────
-    const enrichedTokens = balances.map(b => ({
-      mint: b.mint,
-      symbol: b.symbol || b.mint.slice(0, 8),
-      balance: b.balance,
-      usd: b.usdValue ? Math.round(b.usdValue * 100) / 100 : null,
-    }));
-
-    return {
-      wallet: walletAddress,
-      sol: Math.round(solBalance * 1e6) / 1e6,
-      sol_price: Math.round(solPrice * 100) / 100,
-      sol_usd: Math.round(solUsd * 100) / 100,
-      usdc: Math.round(usdcBalance * 100) / 100,
-      tokens: enrichedTokens,
-      total_usd: Math.round((data.totalUsdValue || 0) * 100) / 100,
-    };
-  } catch (error) {
-    log("wallet_error", error.message);
-    return {
-      wallet: walletAddress,
-      sol: 0,
-      sol_price: 0,
-      sol_usd: 0,
-      usdc: 0,
-      tokens: [],
-      total_usd: 0,
-      error: error.message,
-    };
+    const ui = decimals === 0 ? totalRaw.toString() : (Number(totalRaw / 10n ** BigInt(decimals))).toFixed(decimals).replace(/\.?0+$/, "");
+    return { raw: totalRaw, decimals, ui };
+  } catch (e) {
+    log("wallet_error", `getOnchainTokenBalance ${mint}: ${e.message}`);
+    return { raw: 0n, decimals: 0, ui: "0" };
   }
 }
 
 /**
- * Swap tokens via Jupiter Swap API V2 (order → sign → execute).
+ * Fetch USD price for a mint from Jupiter price API v3.
  */
-const SOL_MINT = "So11111111111111111111111111111111111111112";
+export async function getTokenUsdPrice(mint) {
+  try {
+    const normalized = normalizeMint(mint);
+    const res = await fetch(`${JUPITER_PRICE_API}?ids=${normalized}`, {
+      headers: { "x-api-key": getJupiterApiKey() },
+    });
+    if (!res.ok) return null;
+    const body = await res.json();
+    const price = Number(body?.[normalized]?.usdPrice);
+    return Number.isFinite(price) && price > 0 ? price : null;
+  } catch {
+    return null;
+  }
+}
 
 // Normalize any SOL-like address to the correct wrapped SOL mint
 export function normalizeMint(mint) {
   if (!mint) return mint;
-  const SOL_MINT = "So11111111111111111111111111111111111111112";
   if (
     mint === "SOL" ||
     mint === "native" ||
@@ -142,6 +339,9 @@ export function normalizeMint(mint) {
   return mint;
 }
 
+/**
+ * Swap tokens via Jupiter Swap API V2 (order → sign → execute).
+ */
 export async function swapToken({
   input_mint,
   output_mint,
@@ -165,7 +365,7 @@ export async function swapToken({
 
     // ─── Convert to smallest unit ──────────────────────────────
     let decimals = 9; // SOL default
-    if (input_mint !== config.tokens.SOL) {
+    if (input_mint !== config.SOL) {
       const mintInfo = await connection.getParsedAccountInfo(new PublicKey(input_mint));
       decimals = mintInfo.value?.data?.parsed?.info?.decimals ?? 9;
     }
@@ -241,6 +441,9 @@ export async function swapToken({
       );
     }
 
+    // Invalidate wallet balance cache after successful swap
+    invalidateWalletBalances();
+
     return {
       success: true,
       tx: result.signature,
@@ -256,54 +459,6 @@ export async function swapToken({
   } catch (error) {
     log("swap_error", error.message);
     return { success: false, error: error.message };
-  }
-}
-
-/**
- * Read on-chain token balance directly via RPC (confirmed commitment).
- * Returns { raw: bigint, decimals: number, ui: string }.
- * Uses `confirmed` commitment to see the latest state after a tx lands.
- */
-export async function getOnchainTokenBalance(mint) {
-  const connection = getConnection();
-  const wallet = getWallet();
-  const mintPk = new PublicKey(mint);
-
-  try {
-    const accounts = await connection.getParsedTokenAccountsByOwner(wallet.publicKey, { mint: mintPk }, { commitment: "confirmed" });
-    if (!accounts.value?.length) return { raw: 0n, decimals: 0, ui: "0" };
-    // Sum all token accounts for this mint (should be 1 in practice)
-    let totalRaw = 0n;
-    let decimals = 9;
-    for (const { account } of accounts.value) {
-      const info = account?.data?.parsed?.info;
-      const amt = info?.tokenAmount;
-      if (!info?.mint || amt?.amount == null || !/^\d+$/.test(String(amt.amount))) continue;
-      totalRaw += BigInt(amt.amount);
-      if (decimals === 9 && Number.isInteger(amt.decimals)) decimals = amt.decimals;
-    }
-    const ui = decimals === 0 ? totalRaw.toString() : (Number(totalRaw / 10n ** BigInt(decimals))).toFixed(decimals).replace(/\.?0+$/, "");
-    return { raw: totalRaw, decimals, ui };
-  } catch (e) {
-    log("wallet_error", `getOnchainTokenBalance ${mint}: ${e.message}`);
-    return { raw: 0n, decimals: 0, ui: "0" };
-  }
-}
-
-/**
- * Fetch USD price for a mint from Jupiter price API v3.
- */
-export async function getTokenUsdPrice(mint) {
-  try {
-    const normalized = normalizeMint(mint);
-    const url = `${JUPITER_PRICE_API}?ids=${normalized}&vsTokens=SOL`;
-    const res = await fetch(url);
-    if (!res.ok) return null;
-    const data = await res.json();
-    const price = data?.data?.[normalized]?.price;
-    return typeof price === "number" ? price : null;
-  } catch {
-    return null;
   }
 }
 

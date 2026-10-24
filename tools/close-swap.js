@@ -26,6 +26,7 @@ import { log as defaultLog } from "../logger.js";
 import { getOnchainTokenBalance, getTokenUsdPrice, swapToken, getWallet } from "./wallet.js";
 import { config } from "../config.js";
 import { Connection, PublicKey } from "@solana/web3.js";
+import { load as loadState, findRecentCloseExposure, recordAgentSoldExposure } from "../state.js";
 
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 
@@ -91,7 +92,8 @@ export const RETRY_BACKOFF_MS = [0, 3000, 5000];
 
 // A price-impact refusal (wallet.js maxSwapPriceImpactPct) is terminal too: an
 // immediate retry would quote the same thin route.
-const TERMINAL_SWAP_ERROR = /no route|route not found|unsupported|invalid mint|mint not found|price impact/i;
+// "Insufficient funds" = route exists but not enough SOL liquidity for this amount.
+const TERMINAL_SWAP_ERROR = /no route|route not found|unsupported|invalid mint|mint not found|price impact|insufficient funds/i;
 
 /** Integer part of a BN / integer string / decimal string as a bigint, else null. */
 export function toRawBigInt(v) {
@@ -390,6 +392,16 @@ export async function swapBackWithdrawnBase({ baseMint, symbol = null, preRaw, e
   }
 
   if (succeeded) {
+    // If there's excess over expected withdrawal (e.g. from prior close's leftover),
+    // record it as exposure so a follow-up swap_token can clear it.
+    if (unsoldOverExpectedRaw > 0n && decimals != null) {
+      return {
+        exposureFlag: true,
+        txs,
+        exposure: exposureOf(unsoldOverExpectedRaw),
+        swapOutcome: { success: true, mint: baseMint, attempts, ...extra },
+      };
+    }
     return { exposureFlag: false, txs, swapOutcome: { success: true, mint: baseMint, attempts, ...extra } };
   }
 
@@ -415,4 +427,85 @@ export async function swapBackWithdrawnBase({ baseMint, symbol = null, preRaw, e
       ...extra,
     },
   };
+}
+
+/**
+ * Sweep stranded close exposure: sell any unsold base tokens from recent closes
+ * that are above the dust threshold. This handles tokens that exceeded the
+ * expected withdrawal and were left in the wallet.
+ * @returns {Promise<{ swept: Array<{mint, sold_ui, tx}>, errors: string[] }>}
+ */
+export async function sweepStrandedExposure(deps = {}) {
+  const log = deps.log ?? defaultLog;
+  const readBalance = deps.readBalance ?? getOnchainTokenBalance;
+  const getPrice = deps.getPrice ?? getTokenUsdPrice;
+  const swap = deps.swap ?? swapToken;
+  const sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+
+  const state = loadState();
+  const exposures = state.close_exposure || [];
+  const now = Date.now();
+  const windowMs = 2 * 60 * 60 * 1000; // 2 hours (same as CLOSE_EXPOSURE_WINDOW_MS)
+  const cutoff = now - windowMs;
+
+  const dustUsd = Number(config.management.closeSwapDustUsd ?? 0.05);
+  const swept = [];
+  const errors = [];
+
+  for (const exp of exposures) {
+    if (new Date(exp.created_at).getTime() < cutoff) continue;
+    if (exp.ambiguous_until && new Date(exp.ambiguous_until).getTime() > now) continue;
+
+    const mint = exp.mint;
+    const decimals = exp.decimals;
+    const preRaw = BigInt(exp.pre_raw ?? 0);
+    const unsoldRaw = BigInt(exp.unsold_raw ?? 0);
+    const agentSoldRaw = BigInt(exp.agent_sold_raw ?? 0);
+    const sellableRaw = unsoldRaw - agentSoldRaw;
+
+    if (sellableRaw <= 0n) continue;
+
+    // Check on-chain balance above pre-close
+    let bal;
+    try {
+      bal = await readBalance(mint);
+    } catch (e) {
+      errors.push(`${mint.slice(0, 8)}: balance read failed: ${e.message}`);
+      continue;
+    }
+    const aboveRaw = bal.raw > preRaw ? bal.raw - preRaw : 0n;
+    if (aboveRaw <= 0n) continue;
+
+    const sellRaw = aboveRaw < sellableRaw ? aboveRaw : sellableRaw;
+    const sellUi = rawToUiString(sellRaw, decimals);
+
+    // Dust gate
+    const price = await getPrice(mint);
+    const sellUsd = price != null ? Number(sellUi) * price : null;
+    if (sellUsd != null && sellUsd < dustUsd) {
+      log("close", `Sweep: leaving ${sellUi} ${mint.slice(0, 8)} (~$${sellUsd.toFixed(4)}), under $${dustUsd.toFixed(2)} dust gate`);
+      continue;
+    }
+
+    log("close", `Sweep: auto-swapping ${sellUi} ${mint.slice(0, 8)} -> SOL (stranded exposure, ${sellUsd != null ? `~$${sellUsd.toFixed(2)}` : "unpriced"})`);
+
+    try {
+      const res = await swap({ input_mint: mint, output_mint: "So11111111111111111111111111111111111111112", amount: sellUi }, { impactCap: "close" });
+      if (res?.success) {
+        log("close", `Sweep: sold ${sellUi} ${mint.slice(0, 8)} -> SOL, tx: ${res.tx}`);
+        swept.push({ mint, sold_ui: sellUi, tx: res.tx });
+        // Update agent_sold_raw in state
+        recordAgentSoldExposure(exp.position, mint, sellRaw);
+      } else {
+        const err = res?.error || "unknown";
+        log("close_warn", `Sweep: swap failed for ${mint.slice(0, 8)}: ${err}`);
+        errors.push(`${mint.slice(0, 8)}: ${err}`);
+      }
+    } catch (e) {
+      log("close_warn", `Sweep: swap error for ${mint.slice(0, 8)}: ${e.message}`);
+      errors.push(`${mint.slice(0, 8)}: ${e.message}`);
+    }
+  }
+
+  return { swept, errors };
 }

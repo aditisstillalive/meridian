@@ -8,6 +8,7 @@ import { log } from "./logger.js";
 import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates, degenScore } from "./tools/screening.js";
+import { sweepStrandedExposure } from "./tools/close-swap.js";
 import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
 import { evolveThresholds, getPerformanceSummary } from "./lessons.js";
 import { executeTool, registerCronRestarter } from "./tools/executor.js";
@@ -24,6 +25,7 @@ import {
   isEnabled as telegramEnabled,
   createLiveMessage,
 } from "./telegram.js";
+import { resetLiveMessageDepth } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, confirmPeak, registerExitSignal } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
@@ -345,6 +347,21 @@ export async function runManagementCycle({ silent = false } = {}) {
       if (!config.management.notifSuppress) {
         await liveMessage?.note("No tool actions needed.");
       }
+    }
+
+    // Sweep stranded exposure (tokens left over from closes that exceeded expected withdrawal)
+    try {
+      const sweepResult = await sweepStrandedExposure();
+      if (sweepResult.swept.length > 0) {
+        const sweepLines = sweepResult.swept.map(s => `  ✅ ${s.sold_ui} ${s.mint.slice(0, 8)} -> SOL (${s.tx})`).join("\n");
+        mgmtReport += `\n\n🧹 Exposure Sweep:\n${sweepLines}`;
+        log("cron", `Exposure sweep: sold ${sweepResult.swept.length} stranded token(s)`);
+      }
+      if (sweepResult.errors.length > 0) {
+        mgmtReport += `\n\n⚠️ Sweep errors: ${sweepResult.errors.join(", ")}`;
+      }
+    } catch (e) {
+      log("cron_warn", `Exposure sweep failed: ${e.message}`);
     }
 
     // Trigger screening after management
@@ -969,10 +986,10 @@ function getDeterministicCloseRule(position, managementConfig) {
     (position.minutes_out_of_range ?? 0) >= managementConfig.outOfRangeWaitMinutes
   ) {
     const holdThresh = managementConfig.oorProfitHoldMinPct ?? 0;
-    if (holdThresh > 0 && position.pnl_pct != null && position.pnl_pct >= holdThresh) {
-      return null; // hold profitable OOR position
+    const oorProfitable = holdThresh > 0 && position.pnl_pct != null && position.pnl_pct >= holdThresh;
+    if (!oorProfitable) {
+      return { action: "CLOSE", rule: 4, reason: "OOR" };
     }
-    return { action: "CLOSE", rule: 4, reason: "OOR" };
   }
   if (
     position.fee_per_tvl_24h != null &&
@@ -980,6 +997,22 @@ function getDeterministicCloseRule(position, managementConfig) {
     (position.age_minutes ?? 0) >= 60
   ) {
     return { action: "CLOSE", rule: 5, reason: "low yield" };
+  }
+  // Rule 6: Recovery exit — close at small profit after significant drawdown
+  if (
+    managementConfig.recoveryExitEnabled &&
+    tracked &&
+    tracked.max_drawdown_pct != null &&
+    tracked.max_drawdown_pct >= managementConfig.recoveryExitMinDD &&
+    position.pnl_pct != null &&
+    position.pnl_pct >= managementConfig.recoveryExitTriggerPct &&
+    !pnlSuspect
+  ) {
+    return {
+      action: "CLOSE",
+      rule: 6,
+      reason: `recovery exit: DD ${tracked.max_drawdown_pct.toFixed(1)}% >= ${managementConfig.recoveryExitMinDD}%, PnL ${position.pnl_pct.toFixed(2)}% >= ${managementConfig.recoveryExitTriggerPct}%`,
+    };
   }
   return null;
 }
@@ -1804,6 +1837,7 @@ if (isMain && isTTY) {
   function launchCron() {
     if (!cronStarted) {
       cronStarted = true;
+      resetLiveMessageDepth();
       // Seed timers so countdown starts from now
       timers.managementLastRun = Date.now();
       timers.screeningLastRun = Date.now();
@@ -2078,6 +2112,7 @@ Focus on: hold duration, entry/exit timing, what win rates look like, whether sc
 
 } else if (isMain) {
   // Non-TTY: start immediately
+  resetLiveMessageDepth();
   log("startup", "Non-TTY mode — starting cron cycles immediately.");
   startCronJobs();
   maybeRunMissedBriefing().catch(() => { });

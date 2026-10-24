@@ -1,6 +1,7 @@
 import fs from "fs";
 import { log } from "./logger.js";
 import { repoPath } from "./repo-root.js";
+import { config } from "./config.js";
 
 const USER_CONFIG_PATH = repoPath("user-config.json");
 
@@ -96,18 +97,34 @@ export function isEnabled() {
   return !!TOKEN;
 }
 
-async function postTelegram(method, body) {
+async function postTelegram(method, body, attempt = 1) {
   if (!TOKEN || !chatId) return null;
+  const maxRetries = 3;
+  const baseDelay = 1000;
+  
   try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+    
     const res = await fetch(`${BASE}/${method}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ chat_id: chatId, ...body }),
+      signal: controller.signal,
     });
+    
+    clearTimeout(timeoutId);
+    
     if (!res.ok) {
       const err = await res.text();
       if (res.status === 401) {
         log("telegram_error", `${method} 401 Unauthorized — check TELEGRAM_BOT_TOKEN in .env (invalid, revoked, or encrypted without .envrypt key)`);
+      } else if (res.status >= 500 && attempt < maxRetries) {
+        // Retry on server errors
+        const delay = baseDelay * Math.pow(2, attempt - 1);
+        log("telegram_warn", `${method} ${res.status}: ${err.slice(0, 200)} — retrying in ${delay}ms (attempt ${attempt}/${maxRetries})`);
+        await new Promise(r => setTimeout(r, delay));
+        return postTelegram(method, body, attempt + 1);
       } else {
         log("telegram_error", `${method} ${res.status}: ${err.slice(0, 200)}`);
       }
@@ -115,23 +132,44 @@ async function postTelegram(method, body) {
     }
     return await res.json();
   } catch (e) {
+    if (attempt < maxRetries && (e.name === 'AbortError' || e.message.includes('fetch failed') || e.message.includes('ENOTFOUND') || e.message.includes('ECONNREFUSED') || e.message.includes('ETIMEDOUT'))) {
+      const delay = baseDelay * Math.pow(2, attempt - 1);
+      log("telegram_warn", `${method} network error: ${e.message} — retrying in ${delay}ms (attempt ${attempt}/${maxRetries})`);
+      await new Promise(r => setTimeout(r, delay));
+      return postTelegram(method, body, attempt + 1);
+    }
     log("telegram_error", `${method} failed: ${e.message}`);
     return null;
   }
 }
 
-async function postTelegramRaw(method, body) {
+async function postTelegramRaw(method, body, attempt = 1) {
   if (!TOKEN) return null;
+  const maxRetries = 3;
+  const baseDelay = 1000;
+  
   try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+    
     const res = await fetch(`${BASE}/${method}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+      signal: controller.signal,
     });
+    
+    clearTimeout(timeoutId);
+    
     if (!res.ok) {
       const err = await res.text();
       if (res.status === 401) {
         log("telegram_error", `${method} 401 Unauthorized — check TELEGRAM_BOT_TOKEN in .env (invalid, revoked, or encrypted without .envrypt key)`);
+      } else if (res.status >= 500 && attempt < maxRetries) {
+        const delay = baseDelay * Math.pow(2, attempt - 1);
+        log("telegram_warn", `${method} ${res.status}: ${err.slice(0, 200)} — retrying in ${delay}ms (attempt ${attempt}/${maxRetries})`);
+        await new Promise(r => setTimeout(r, delay));
+        return postTelegramRaw(method, body, attempt + 1);
       } else {
         log("telegram_error", `${method} ${res.status}: ${err.slice(0, 200)}`);
       }
@@ -139,6 +177,12 @@ async function postTelegramRaw(method, body) {
     }
     return await res.json();
   } catch (e) {
+    if (attempt < maxRetries && (e.name === 'AbortError' || e.message.includes('fetch failed') || e.message.includes('ENOTFOUND') || e.message.includes('ECONNREFUSED') || e.message.includes('ETIMEDOUT'))) {
+      const delay = baseDelay * Math.pow(2, attempt - 1);
+      log("telegram_warn", `${method} network error: ${e.message} — retrying in ${delay}ms (attempt ${attempt}/${maxRetries})`);
+      await new Promise(r => setTimeout(r, delay));
+      return postTelegramRaw(method, body, attempt + 1);
+    }
     log("telegram_error", `${method} failed: ${e.message}`);
     return null;
   }
@@ -189,6 +233,13 @@ export async function answerCallbackQuery(callbackQueryId, text = "") {
 
 export function hasActiveLiveMessage() {
   return _liveMessageDepth > 0;
+}
+
+export function resetLiveMessageDepth() {
+  const old = _liveMessageDepth;
+  _liveMessageDepth = 0;
+  log("telegram", `resetLiveMessageDepth: was ${old}`);
+  return old;
 }
 
 function createTypingIndicator() {
@@ -324,7 +375,12 @@ export async function createLiveMessage(title, intro = "Starting...") {
   }
 
   _liveMessageDepth += 1;
-  await flushNow();
+  try {
+    await flushNow();
+  } catch (e) {
+    _liveMessageDepth = Math.max(0, _liveMessageDepth - 1);
+    throw e;
+  }
 
   return {
     async toolStart(name) {
@@ -462,7 +518,10 @@ export function stopPolling() {
 
 // ─── Notification helpers ────────────────────────────────────────
 export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, rangeCoverage, binStep, baseFee }) {
-  if (hasActiveLiveMessage()) return;
+  if (hasActiveLiveMessage() && !config.management?.notifDuringLiveMessage) {
+    log("telegram", `notifyDeploy suppressed: liveMessageDepth=${_liveMessageDepth}, notifDuringLiveMessage=${config.management?.notifDuringLiveMessage}`);
+    return;
+  }
   const priceStr = priceRange
     ? `Price range: ${priceRange.min < 0.0001 ? priceRange.min.toExponential(3) : priceRange.min.toFixed(6)} – ${priceRange.max < 0.0001 ? priceRange.max.toExponential(3) : priceRange.max.toFixed(6)}\n`
     : "";
@@ -473,7 +532,7 @@ export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, 
     ? `Bin step: ${binStep ?? "?"}  |  Base fee: ${baseFee != null ? baseFee + "%" : "?"}\n`
     : "";
   await sendHTML(
-    `✅ <b>Deployed</b> ${pair}\n` +
+    `✅ <b>Deployed</b> ${escapeHtml(pair)}\n` +
     `Amount: ${amountSol} SOL\n` +
     priceStr +
     coverageStr +
@@ -484,34 +543,56 @@ export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, 
 }
 
 export async function notifyClose({ pair, pnlUsd, pnlPct, reason }) {
-  if (hasActiveLiveMessage()) return;
+  if (hasActiveLiveMessage() && !config.management?.notifDuringLiveMessage) {
+    log("telegram", `notifyClose suppressed: liveMessageDepth=${_liveMessageDepth}, notifDuringLiveMessage=${config.management?.notifDuringLiveMessage}`);
+    return;
+  }
   const sign = pnlUsd >= 0 ? "+" : "";
+  const pnl = pnlUsd ?? 0;
+  const icon = pnl > 0 ? "🟢" : pnl < 0 ? "🔴" : "🔒";
   await sendHTML(
-    `🔒 <b>Closed</b> ${pair}\n` +
-    `${reason}\n` +
-    `PnL: ${sign}$${(pnlUsd ?? 0).toFixed(2)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)`
+    `${icon} <b>Closed</b> ${escapeHtml(pair)}\n` +
+    `${escapeHtml(reason)}\n` +
+    `PnL: ${sign}$${pnl.toFixed(2)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)`
   );
 }
 
 export async function notifySwap({ inputSymbol, outputSymbol, amountIn, amountOut, tx }) {
-  if (hasActiveLiveMessage()) return;
+  if (hasActiveLiveMessage() && !config.management?.notifDuringLiveMessage) {
+    log("telegram", `notifySwap suppressed: liveMessageDepth=${_liveMessageDepth}, notifDuringLiveMessage=${config.management?.notifDuringLiveMessage}`);
+    return;
+  }
   await sendHTML(
-    `🔄 <b>Swapped</b> ${inputSymbol} → ${outputSymbol}\n` +
+    `🔄 <b>Swapped</b> ${escapeHtml(inputSymbol)} → ${escapeHtml(outputSymbol)}\n` +
     `In: ${amountIn ?? "?"} | Out: ${amountOut ?? "?"}\n` +
     `Tx: <code>${tx?.slice(0, 16)}...</code>`
   );
 }
 
 export async function notifyOutOfRange({ pair, minutesOOR }) {
-  if (hasActiveLiveMessage()) return;
+  if (hasActiveLiveMessage() && !config.management?.notifDuringLiveMessage) {
+    log("telegram", `notifyOutOfRange suppressed: liveMessageDepth=${_liveMessageDepth}, notifDuringLiveMessage=${config.management?.notifDuringLiveMessage}`);
+    return;
+  }
   await sendHTML(
-    `⚠️ <b>Out of Range</b> ${pair}\n` +
+    `⚠️ <b>Out of Range</b> ${escapeHtml(pair)}\n` +
     `Been OOR for ${minutesOOR} minutes`
   );
 }
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+function escapeHtml(text) {
+  if (!text) return "";
+  return String(text)
+    .replace(/&/g, "\u0026\u0061\u006d\u0070\u003b")
+    .replace(/</g, "\u0026\u006c\u0074\u003b")
+    .replace(/>/g, "\u0026\u0067\u0074\u003b")
+    .replace(/"/g, "\u0026\u0071\u0075\u006f\u0074\u003b")
+    .replace(/'/g, "\u0026\u0023\u0030\u0033\u0039\u003b")
+    .replace(/[^\x00-\x7F]/g, (char) => "\u0026\u0023" + char.codePointAt(0) + "\u003b");
 }
 
 function fmtPct(value) {
