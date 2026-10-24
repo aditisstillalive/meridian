@@ -110,6 +110,7 @@ export const config = {
     minClaimAmount:        u.minClaimAmount        ?? 5,
     autoSwapAfterClaim:    u.autoSwapAfterClaim    ?? false,
     notifSuppress:         u.notifSuppress         ?? false,   // only notify deploy/close/swap/briefing
+    notifDuringLiveMessage: u.notifDuringLiveMessage ?? false,
     autoSwapRetryAttempts: u.autoSwapRetryAttempts ?? 3,     // retries for base→SOL auto-swap on Jupiter failure
     autoSwapRetryDelayMs:  u.autoSwapRetryDelayMs  ?? 3000,  // delay between auto-swap retries
     autoSwapSettleDelayMs: u.autoSwapSettleDelayMs ?? 8000,  // wait before first balance check (let token account settle)
@@ -147,6 +148,10 @@ export const config = {
     closeSwapDustUsd: u.closeSwapDustUsd ?? 0.05,
     // Post-close auto-swap tolerance (bps) — extra % above expected withdrawal to sell
     closeSwapToleranceBps: u.closeSwapToleranceBps ?? 500,
+    // Recovery exit — close at small profit after significant drawdown
+    recoveryExitEnabled: u.recoveryExitEnabled ?? true,
+    recoveryExitTriggerPct: u.recoveryExitTriggerPct ?? 1,
+    recoveryExitMinDD: u.recoveryExitMinDD ?? 8,
   },
 
   // ─── Strategy Mapping ───────────────────

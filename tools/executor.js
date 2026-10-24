@@ -405,6 +405,10 @@ const toolMap = {
       maxCloseSwapPriceImpactPct: ["management", "maxCloseSwapPriceImpactPct"],
       closeSwapDustUsd: ["management", "closeSwapDustUsd"],
       closeSwapToleranceBps: ["management", "closeSwapToleranceBps"],
+      // Recovery exit
+      recoveryExitEnabled: ["management", "recoveryExitEnabled"],
+      recoveryExitTriggerPct: ["management", "recoveryExitTriggerPct"],
+      recoveryExitMinDD: ["management", "recoveryExitMinDD"],
       // pnl poller
       pnlConfirmTicks: ["pnl", "confirmTicks"],
       // opportunity poller (interval/enabled changes apply on next restart)

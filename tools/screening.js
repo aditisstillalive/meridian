@@ -620,9 +620,17 @@ export async function getTopCandidates({ limit = 10 } = {}) {
 
   // Exclude pools where the wallet already has an open position
   const { getMyPositions } = await import("./dlmm.js");
-  const { positions } = await getMyPositions();
-  const occupiedPools = new Set(positions.map((p) => p.pool));
-  const occupiedMints = new Set(positions.map((p) => p.base_mint).filter(Boolean));
+  const { getTrackedPositions } = await import("../state.js");
+  const { positions } = await getMyPositions({ force: true });
+  const tracked = getTrackedPositions(true); // open only
+  const occupiedPools = new Set([
+    ...positions.map((p) => p.pool),
+    ...tracked.map((p) => p.pool),
+  ]);
+  const occupiedMints = new Set([
+    ...positions.map((p) => p.base_mint).filter(Boolean),
+    ...tracked.map((p) => p.base_mint).filter(Boolean),
+  ]);
   const minTvl = Number(config.screening.minTvl ?? 0);
   const maxTvl = config.screening.maxTvl == null ? null : Number(config.screening.maxTvl);
   const minFeeActiveTvlRatio = Number(config.screening.minFeeActiveTvlRatio ?? 0);

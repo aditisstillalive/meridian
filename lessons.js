@@ -181,6 +181,8 @@ export async function recordPerformance(perf) {
       exit_mcap: perf.exit_mcap,
       exit_tvl: perf.exit_tvl,
       exit_volume: perf.exit_volume,
+      max_pnl_pct: entry.max_pnl_pct ?? null,
+      max_drawdown_pct: entry.max_drawdown_pct ?? null,
     });
   }
 
@@ -242,6 +244,12 @@ function derivLesson(perf) {
     `organic=${perf.organic_score}`,
     `bin_range=${typeof perf.bin_range === 'object' ? JSON.stringify(perf.bin_range) : perf.bin_range}`,
   ];
+  if (perf.max_pnl_pct != null) {
+    contextParts.push(`max_pnl=${perf.max_pnl_pct.toFixed(1)}%`);
+  }
+  if (perf.max_drawdown_pct != null) {
+    contextParts.push(`max_dd=${perf.max_drawdown_pct.toFixed(1)}%`);
+  }
   if (perf.entry_mcap != null || perf.entry_tvl != null || perf.entry_volume != null) {
     contextParts.push(`entry(mcap=${fmtNum(perf.entry_mcap)}, tvl=${fmtNum(perf.entry_tvl)}, vol=${fmtNum(perf.entry_volume)})`);
   }
@@ -305,6 +313,8 @@ function derivLesson(perf) {
     confidence: Math.round(confidence * 100) / 100,
     context,
     pnl_pct: perf.pnl_pct,
+    max_pnl_pct: perf.max_pnl_pct ?? null,
+    max_drawdown_pct: perf.max_drawdown_pct ?? null,
     fees_earned_usd: perf.fees_earned_usd,
     initial_value_usd: perf.initial_value_usd,
     range_efficiency: perf.range_efficiency,
@@ -706,6 +716,8 @@ export function getPerformanceHistory({ hours = 24, limit = 50 } = {}) {
       strategy: r.strategy,
       pnl_usd: r.pnl_usd,
       pnl_pct: r.pnl_pct,
+      max_pnl_pct: r.max_pnl_pct,
+      max_drawdown_pct: r.max_drawdown_pct,
       fees_earned_usd: r.fees_earned_usd,
       range_efficiency: r.range_efficiency,
       minutes_held: r.minutes_held,
@@ -739,6 +751,16 @@ export function getPerformanceSummary() {
   const avgRangeEfficiency = p.reduce((s, x) => s + x.range_efficiency, 0) / p.length;
   const wins = p.filter((x) => x.pnl_usd > 0).length;
 
+  // Max PnL and drawdown stats
+  const validMaxPnl = p.filter((x) => x.max_pnl_pct != null);
+  const validMaxDd = p.filter((x) => x.max_drawdown_pct != null);
+  const avgMaxPnlPct = validMaxPnl.length > 0
+    ? validMaxPnl.reduce((s, x) => s + x.max_pnl_pct, 0) / validMaxPnl.length
+    : null;
+  const avgMaxDrawdownPct = validMaxDd.length > 0
+    ? validMaxDd.reduce((s, x) => s + x.max_drawdown_pct, 0) / validMaxDd.length
+    : null;
+
   return {
     total_positions_closed: p.length,
     total_pnl_usd: Math.round(totalPnl * 100) / 100,
@@ -746,5 +768,7 @@ export function getPerformanceSummary() {
     avg_range_efficiency_pct: Math.round(avgRangeEfficiency * 10) / 10,
     win_rate_pct: Math.round((wins / p.length) * 100),
     total_lessons: data.lessons.length,
+    avg_max_pnl_pct: avgMaxPnlPct != null ? Math.round(avgMaxPnlPct * 100) / 100 : null,
+    avg_max_drawdown_pct: avgMaxDrawdownPct != null ? Math.round(avgMaxDrawdownPct * 100) / 100 : null,
   };
 }

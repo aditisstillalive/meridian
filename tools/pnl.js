@@ -1,11 +1,14 @@
 import { Connection, PublicKey } from "@solana/web3.js";
+import bs58 from "bs58";
 import { config } from "../config.js";
 import { log } from "../logger.js";
+import { getPoolMetadata } from "./dlmm.js";
 import {
   getTrackedPosition,
   markOutOfRange,
   markInRange,
   minutesOutOfRange,
+  getTrackedPositions,
 } from "../state.js";
 
 // ─── Public-infra PnL engine ───────────────────────────────────
@@ -18,6 +21,84 @@ import {
 
 const JUP_SEARCH = "https://datapi.jup.ag/v1/assets/search";
 const METEORA_PNL = "https://dlmm.datapi.meteora.ag/positions";
+
+// ─── Cached position discovery (like neo/meridian) ─────────────────
+// PositionV2 account layout: discriminator(8) + lb_pair(32) + owner(32) = 72 bytes head
+const DLMM_PROGRAM_ID = new PublicKey("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo");
+const POSITION_V2_DISCRIMINATOR = Buffer.from("75b0d4c7f5b485b6", "hex");
+const POSITION_HEAD_LEN = 72;
+const POSITION_DISCOVERY_INTERVAL_MS = 5 * 60_000; // full getProgramAccounts every 5 min
+let _knownPositionAccounts = new Map(); // position → lb_pair, from last discovery scan
+let _lastPositionDiscoveryAt = 0;
+// Cached full position data (liquidity amounts, bin bounds) — refreshed during discovery
+let _cachedFlat = null;
+let _cachedFlatAt = 0;
+
+export function invalidatePositionCache() {
+  _cachedFlat = null;
+  _cachedFlatAt = 0;
+  _lastPositionDiscoveryAt = 0;
+  log("pnl", "Position cache invalidated");
+}
+
+function positionAccountFilters(owner) {
+  return [
+    { memcmp: { offset: 0, bytes: bs58.encode(POSITION_V2_DISCRIMINATOR) } },
+    { memcmp: { offset: 40, bytes: owner.toBase58() } },
+  ];
+}
+
+/** lb_pair of a PositionV2 account owned by `owner`, or null (closed / not a position / not ours). */
+function positionHeadPool(info, owner) {
+  if (!info?.data || !info.owner?.equals?.(DLMM_PROGRAM_ID)) return null;
+  const d = Buffer.from(info.data);
+  if (d.length < POSITION_HEAD_LEN) return null;
+  if (!d.subarray(0, 8).equals(POSITION_V2_DISCRIMINATOR)) return null;
+  if (!d.subarray(40, 72).equals(owner.toBuffer())) return null;
+  return new PublicKey(d.subarray(8, 40)).toBase58();
+}
+
+/**
+ * The wallet's open DLMM position accounts → [{ position, pool }].
+ * Uses cached discovery: full getProgramAccounts every 5 min, cheap getMultipleAccountsInfo in between.
+ */
+async function listPositionAccounts(owner, { discover = false, trackedOpen = null, now = Date.now() } = {}) {
+  const connection = getPnlConnection();
+  if (discover || now - _lastPositionDiscoveryAt >= POSITION_DISCOVERY_INTERVAL_MS) {
+    const accs = await connection.getProgramAccounts(DLMM_PROGRAM_ID, {
+      filters: positionAccountFilters(owner),
+      dataSlice: { offset: 0, length: POSITION_HEAD_LEN },
+    });
+    const found = new Map();
+    for (const a of accs) {
+      const pool = positionHeadPool({ owner: DLMM_PROGRAM_ID, data: a.account.data }, owner);
+      if (pool) found.set(a.pubkey.toBase58(), pool);
+    }
+    _knownPositionAccounts = found;
+    _lastPositionDiscoveryAt = now;
+    return [...found].map(([position, pool]) => ({ position, pool }));
+  }
+
+  const tracked = trackedOpen ?? getTrackedPositions(true).map((p) => p.position);
+  const keys = [...new Set([...tracked, ..._knownPositionAccounts.keys()])];
+  if (keys.length === 0) return [];
+  const infos = [];
+  for (let i = 0; i < keys.length; i += 100) {
+    const batch = keys.slice(i, i + 100).map((k) => new PublicKey(k));
+    infos.push(...await connection.getMultipleAccountsInfo(batch, { dataSlice: { offset: 0, length: POSITION_HEAD_LEN } }));
+  }
+  const out = [];
+  keys.forEach((position, i) => {
+    const pool = positionHeadPool(infos[i], owner);
+    if (pool) {
+      out.push({ position, pool });
+      _knownPositionAccounts.set(position, pool);
+    } else {
+      _knownPositionAccounts.delete(position);
+    }
+  });
+  return out;
+}
 
 // Lazy SDK load — mirrors tools/dlmm.js (CJS dir-imports break in ESM at import time).
 let _DLMM = null;
@@ -150,7 +231,7 @@ function mapEntries(map) {
 }
 
 // ─── Build the shaped position object (matches getMyPositions output) ──
-function buildPosition(f, prices, solUsd, meteora, solMode) {
+async function buildPosition(f, prices, solUsd, meteora, solMode) {
   const priceX = f.baseMint ? (prices[f.baseMint] ?? 0) : 0;
 
   const xHuman = safeNum(f.xRaw) / 10 ** f.decX;
@@ -210,10 +291,27 @@ function buildPosition(f, prices, solUsd, meteora, solMode) {
     : null;
   const ageMinutes = meteora?.createdAt ? Math.floor((Date.now() - meteora.createdAt * 1000) / 60000) : ageFromState;
 
+  // Enrich meteora with token symbols from pool metadata if missing
+  let enrichedMeteora = meteora;
+  if (meteora && (!meteora.tokenX || !meteora.tokenY)) {
+    try {
+      const meta = await getPoolMetadata(f.pool);
+      if (meta?.token_x_symbol || meta?.token_y_symbol) {
+        enrichedMeteora = {
+          ...meteora,
+          tokenX: meteora.tokenX ?? meta.token_x_symbol,
+          tokenY: meteora.tokenY ?? meta.token_y_symbol,
+        };
+      }
+    } catch (e) {
+      log("pnl_warn", `Failed to enrich pool metadata for ${f.pool.slice(0, 8)}: ${e.message}`);
+    }
+  }
+
   return {
     position:           f.position,
     pool:               f.pool,
-    pair:               tracked?.pool_name || (meteora ? `${meteora.tokenX ?? "?"}/${meteora.tokenY ?? "SOL"}` : "?/SOL"),
+    pair:               tracked?.pool_name || (enrichedMeteora ? `${enrichedMeteora.tokenX ?? "?"}/${enrichedMeteora.tokenY ?? "SOL"}` : "?/SOL"),
     base_mint:          f.baseMint,
     lower_bin:          f.lower ?? tracked?.bin_range?.min ?? null,
     upper_bin:          f.upper ?? tracked?.bin_range?.max ?? null,
@@ -246,42 +344,60 @@ export async function computePositions(walletAddress) {
   const SOL_MINT = config.tokens.SOL;
   const conn = getPnlConnection();
   const DLMM = await loadDlmmSdk();
+  const walletPubkey = new PublicKey(walletAddress);
 
-  const map = await DLMM.getAllLbPairPositionsByUser(conn, new PublicKey(walletAddress));
-  _pollCount++;
-  if (_pollCount % 20 === 1) {
-    const n = [...mapEntries(map)].reduce((s, [, i]) => s + (i?.lbPairPositionsData?.length ?? 0), 0);
-    log("pnl_tick", `poller alive — ${n} position(s) tracked (tick #${_pollCount})`);
+  // Check if we need to do full discovery (every 5 min)
+  const now = Date.now();
+  const needDiscovery = now - _lastPositionDiscoveryAt >= POSITION_DISCOVERY_INTERVAL_MS || _cachedFlat === null;
+
+  let flat;
+  if (needDiscovery) {
+    // Full discovery: use SDK to get complete position data including liquidity amounts
+    const map = await DLMM.getAllLbPairPositionsByUser(conn, walletPubkey);
+    flat = [];
+    for (const [lbPairKey, info] of mapEntries(map)) {
+      const decX = info?.tokenX?.mint?.decimals ?? 9;
+      const decY = info?.tokenY?.mint?.decimals ?? 9;
+      const baseMint = info?.tokenX?.mint?.address?.toString?.() ?? null;
+      const active = info?.lbPair?.activeId ?? null;
+      for (const p of info?.lbPairPositionsData || []) {
+        const d = p.positionData || {};
+        flat.push({
+          position: p.publicKey.toString(),
+          pool: lbPairKey,
+          baseMint,
+          decX,
+          decY,
+          active,
+          lower: d.lowerBinId ?? null,
+          upper: d.upperBinId ?? null,
+          xRaw: d.totalXAmount,
+          yRaw: d.totalYAmount,
+          feeXRaw: d.feeX?.toString?.() ?? d.feeX ?? 0,
+          feeYRaw: d.feeY?.toString?.() ?? d.feeY ?? 0,
+        });
+      }
+    }
+    // Cache for next 5 minutes
+    _cachedFlat = flat;
+    _cachedFlatAt = now;
+    _lastPositionDiscoveryAt = now;
+  } else {
+    // Use cached position data (liquidity amounts, bin bounds) — fresh prices & deposits fetched below
+    flat = _cachedFlat || [];
   }
 
-  const flat = [];
-  for (const [lbPairKey, info] of mapEntries(map)) {
-    const decX = info?.tokenX?.mint?.decimals ?? 9;
-    const decY = info?.tokenY?.mint?.decimals ?? 9;
-    const baseMint = info?.tokenX?.mint?.address?.toString?.() ?? null;
-    const active = info?.lbPair?.activeId ?? null;
-    for (const p of info?.lbPairPositionsData || []) {
-      const d = p.positionData || {};
-      flat.push({
-        position: p.publicKey.toString(),
-        pool: lbPairKey,
-        baseMint,
-        decX,
-        decY,
-        active,
-        lower: d.lowerBinId ?? null,
-        upper: d.upperBinId ?? null,
-        xRaw: d.totalXAmount,
-        yRaw: d.totalYAmount,
-        feeXRaw: d.feeX?.toString?.() ?? d.feeX ?? 0,
-        feeYRaw: d.feeY?.toString?.() ?? d.feeY ?? 0,
-      });
-    }
+  _pollCount++;
+  if (_pollCount % 20 === 1) {
+    log("pnl_tick", `poller alive — ${flat.length} position(s) tracked (tick #${_pollCount})`);
   }
 
   if (flat.length === 0) {
     return { wallet: walletAddress, total_positions: 0, positions: [], source: "rpc" };
   }
+
+  // Still run listPositionAccounts to update _knownPositionAccounts (cheap, no full scan)
+  await listPositionAccounts(walletPubkey);
 
   const [prices, meteoraByPosition] = await Promise.all([
     getJupiterPrices([SOL_MINT, ...flat.map((f) => f.baseMint)]),
@@ -289,7 +405,7 @@ export async function computePositions(walletAddress) {
   ]);
   const solUsd = prices[SOL_MINT] ?? null;
 
-  const positions = flat.map((f) => buildPosition(f, prices, solUsd, meteoraByPosition[f.position], solMode));
+  const positions = await Promise.all(flat.map((f) => buildPosition(f, prices, solUsd, meteoraByPosition[f.position], solMode)));
 
   return { wallet: walletAddress, total_positions: positions.length, positions, source: "rpc" };
 }

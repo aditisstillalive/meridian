@@ -23,15 +23,17 @@ import {
   minutesOutOfRange,
   syncOpenPositions,
   recordCloseExposure,
+  recordAgentSoldExposure,
+  load,
 } from "../state.js";
 import { recordPerformance } from "../lessons.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
 import { swapBackWithdrawnBase, expectedBaseWithdrawRaw, expectedClaimFeeRaw, getPnlTokenBalance } from "./close-swap.js";
-import { getOnchainTokenBalance, getTokenUsdPrice, normalizeMint } from "./wallet.js";
+import { getOnchainTokenBalance, getTokenUsdPrice, normalizeMint, uiToRawAmount } from "./wallet.js";
 import { appendDecision } from "../decision-log.js";
 import { agentMeridianJson, getAgentIdForRequests, getAgentMeridianHeaders } from "./agent-meridian.js";
 import { getAndClearStagedSignals } from "../signal-tracker.js";
-import { computePositions, fetchDlmmPnlForPool } from "./pnl.js";
+import { computePositions, fetchDlmmPnlForPool, invalidatePositionCache } from "./pnl.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -405,7 +407,7 @@ async function getPool(poolAddress) {
 setInterval(() => poolCache.clear(), 5 * 60 * 1000);
 setInterval(() => poolMetadataCache.clear(), 15 * 60 * 1000);
 
-async function getPoolMetadata(poolAddress) {
+export async function getPoolMetadata(poolAddress) {
   const key = String(poolAddress);
   if (poolMetadataCache.has(key)) {
     return poolMetadataCache.get(key);
@@ -1152,6 +1154,18 @@ async function processSyncedCloseSwaps(closedPositions) {
       const baseMint = pos.base_mint;
       if (!baseMint) continue;
 
+      // Check if this position was already closed by the agent (normal close path)
+      // which runs swap-back before marking closed. If so, skip to avoid double-swap.
+      const state = load();
+      const fullPos = state.positions[pos.position];
+      if (fullPos?.notes?.length) {
+        const latestNote = fullPos.notes[fullPos.notes.length - 1];
+        if (latestNote.includes("Closed at") && !latestNote.includes("Auto-closed during state sync")) {
+          log("close", `State-sync close: skipping swap-back for ${pos.position} (already closed by agent)`);
+          continue;
+        }
+      }
+
       // Best-effort pre-close balance: we don't have a true pre-close snapshot,
       // so read current balance and treat any balance of this mint as withdrawn.
       const bal = await getPnlTokenBalance(baseMint) ?? await getOnchainTokenBalance(baseMint);
@@ -1177,6 +1191,12 @@ async function processSyncedCloseSwaps(closedPositions) {
 
       if (swapResult.swapOutcome?.success) {
         log("close", `State-sync close: swapped ${baseMint.slice(0, 8)} back to SOL`);
+        // Record agent sold amount for swap_guard tracking
+        if (swapResult.swapOutcome.sold_ui && swapResult.exposure?.decimals) {
+          const soldRaw = uiToRawAmount(swapResult.swapOutcome.sold_ui, swapResult.exposure.decimals);
+          recordAgentSoldExposure(pos.position, baseMint, soldRaw);
+          log("close", `Recorded agent sold ${swapResult.swapOutcome.sold_ui} ${baseMint.slice(0, 8)} for exposure tracking (state-sync)`);
+        }
       } else {
         log("close_warn", `State-sync close: swap-back not possible for ${baseMint.slice(0, 8)} (no pre-close snapshot); exposure recorded for manual swap_token`);
       }
@@ -1675,6 +1695,10 @@ export async function closePosition({ position_address, reason }) {
         };
       }
 
+      // Mark position closed BEFORE swap-back to prevent state-sync race
+      recordClose(position_address, reason || "agent decision");
+      invalidatePositionCache();
+
       // ─── Post-close delta swap-back (close-swap integration) ───────
       let swapOutcome = null;
       let autoSwapped = false;
@@ -1703,12 +1727,30 @@ export async function closePosition({ position_address, reason }) {
             ambiguousUntil: swapResult.exposure.ambiguous ? new Date(Date.now() + 30 * 60 * 1000).toISOString() : null,
           });
           log("close_warn", `Post-close swap left exposure for ${baseMint}: ${swapResult.exposure.unsold_raw} raw unsold`);
+
+          // Record how much the agent actually sold so swap_guard knows
+          if (swapResult.swapOutcome?.success && swapResult.swapOutcome.sold_ui) {
+            const soldRaw = uiToRawAmount(swapResult.swapOutcome.sold_ui, swapResult.exposure.decimals);
+            recordAgentSoldExposure(position_address, swapResult.exposure.mint, soldRaw);
+            log("close", `Recorded agent sold ${swapResult.swapOutcome.sold_ui} ${baseMint.slice(0, 8)} for exposure tracking`);
+          }
+        } else if (swapResult.swapOutcome?.success && swapResult.swapOutcome.sold_ui) {
+          // Full success (no exposure), but create exposure entry with agent_sold_raw for swap_guard
+          recordCloseExposure({
+            position: position_address,
+            mint: baseMint,
+            preRaw: preRaw,
+            decimals: swapResult.exposure?.decimals ?? 9,
+            unsoldRaw: 0n,
+            ambiguousUntil: null,
+          });
+          const soldRaw = uiToRawAmount(swapResult.swapOutcome.sold_ui, swapResult.exposure?.decimals ?? 9);
+          recordAgentSoldExposure(position_address, baseMint, soldRaw);
+          log("close", `Recorded agent sold ${swapResult.swapOutcome.sold_ui} ${baseMint.slice(0, 8)} for exposure tracking (full success)`);
         }
       } catch (e) {
         log("close_warn", `Post-close swap error: ${e.message}`);
       }
-
-      recordClose(position_address, reason || "agent decision");
 
       if (tracked) {
         const deployedAt = new Date(tracked.deployed_at).getTime();
@@ -1746,6 +1788,11 @@ export async function closePosition({ position_address, reason }) {
         } catch (e) {
           log("close_warn", `Relay closed PnL fetch failed: ${e.message}`);
         }
+        // If API gave us PnL but withdrawals not settled (finalValueUsd === 0), derive it
+        if (finalValueUsd === 0 && initialUsd > 0 && Number.isFinite(pnlUsd) && Number.isFinite(feesUsd)) {
+          finalValueUsd = Math.max(0, initialUsd + pnlUsd - feesUsd);
+          log("close", `Derived finalValueUsd from PnL: ${finalValueUsd.toFixed(2)} USD (initial=${initialUsd.toFixed(2)}, pnl=${pnlUsd.toFixed(2)}, fees=${feesUsd.toFixed(2)})`);
+        }
 
         const closeBaseMint = livePosition?.base_mint || pool.lbPair.tokenXMint.toString();
         const signalSnapshot = resolvePerformanceSignalSnapshot({
@@ -1767,6 +1814,10 @@ export async function closePosition({ position_address, reason }) {
             };
           }
         } catch { /* non-blocking */ }
+
+        const trackedPos = getTrackedPosition(position_address);
+        const max_pnl_pct = trackedPos?.peak_pnl_pct ?? null;
+        const max_drawdown_pct = trackedPos?.max_drawdown_pct ?? null;
 
         await recordPerformance({
           position: position_address,
@@ -1791,6 +1842,8 @@ export async function closePosition({ position_address, reason }) {
           entry_tvl: tracked.entry_tvl ?? null,
           entry_volume: tracked.entry_volume ?? null,
           entry_holders: tracked.entry_holders ?? null,
+          max_pnl_pct,
+          max_drawdown_pct,
           ...exitMarket,
         });
 
@@ -1860,12 +1913,17 @@ export async function closePosition({ position_address, reason }) {
         swap_outcome: swapOutcome,
         exposure: exposureFlag ? "success_with_exposure" : null,
         reason: reason || "agent decision",
+        pnl_usd: fallbackPnl.pnlUsd,
+        pnl_pct: fallbackPnl.pnlPct,
       };
       } catch (relayError) {
         if (relaySubmitted) throw relayError;
         log("close_warn", `Relay zap-out failed before submit; falling back to local close + Jupiter autoswap: ${relayError.message}`);
       }
     }
+
+    // Fetch fallback PnL from Meteora API for untracked positions
+    const fallbackPnl = await fetchFallbackPnl(poolAddress, position_address);
 
     // Clear cached pool so SDK loads fresh position fee state
     poolCache.delete(poolAddress.toString());
@@ -1875,6 +1933,7 @@ export async function closePosition({ position_address, reason }) {
     const baseMint = pool.lbPair.tokenXMint.toString();
     let preRaw = null;
     let expectedRaw = null;
+    let positionAlreadyClosed = false;
     try {
       const bal = await getPnlTokenBalance(baseMint) ?? await getOnchainTokenBalance(baseMint);
       preRaw = bal.raw;
@@ -1883,7 +1942,21 @@ export async function closePosition({ position_address, reason }) {
       expectedRaw = expectedBaseWithdrawRaw(pool, positionDataForExpected, baseMint);
       log("close", `Pre-close balance for ${baseMint}: ${preRaw} raw (expected withdrawal: ${expectedRaw ?? "unknown"} raw)`);
     } catch (e) {
-      log("close_warn", `Pre-close balance snapshot failed: ${e.message}`);
+      const msg = String(e.message || e);
+      if (msg.includes("not found") || msg.includes("AccountOwnedByWrongProgram") || msg.includes("3007")) {
+        positionAlreadyClosed = true;
+        log("close", `Position ${position_address} not found on-chain (already closed?) — will attempt post-close swap anyway`);
+        // Still get pre-close balance from wallet for delta swap
+        try {
+          const bal = await getPnlTokenBalance(baseMint) ?? await getOnchainTokenBalance(baseMint);
+          preRaw = bal.raw;
+          log("close", `Pre-close balance for ${baseMint} (from wallet): ${preRaw} raw`);
+        } catch (e2) {
+          log("close_warn", `Could not get pre-close balance: ${e2.message}`);
+        }
+      } else {
+        log("close_warn", `Pre-close balance snapshot failed: ${e.message}`);
+      }
     }
 
     const positionPubKey = new PublicKey(position_address);
@@ -1931,78 +2004,97 @@ export async function closePosition({ position_address, reason }) {
     let hasLiquidity = false;
     let closeFromBinId = -887272;
     let closeToBinId = 887272;
-    try {
-      const positionDataForClose = await pool.getPosition(positionPubKey);
-      const processed = positionDataForClose?.positionData;
-      if (processed) {
-        closeFromBinId = processed.lowerBinId ?? closeFromBinId;
-        closeToBinId = processed.upperBinId ?? closeToBinId;
-        const bins = Array.isArray(processed.positionBinData) ? processed.positionBinData : [];
-        hasLiquidity = bins.some((bin) => new BN(bin.positionLiquidity || "0").gt(new BN(0)));
+    let closeTxError = null;
+    if (!positionAlreadyClosed) {
+      try {
+        const positionDataForClose = await pool.getPosition(positionPubKey);
+        const processed = positionDataForClose?.positionData;
+        if (processed) {
+          closeFromBinId = processed.lowerBinId ?? closeFromBinId;
+          closeToBinId = processed.upperBinId ?? closeToBinId;
+          const bins = Array.isArray(processed.positionBinData) ? processed.positionBinData : [];
+          hasLiquidity = bins.some((bin) => new BN(bin.positionLiquidity || "0").gt(new BN(0)));
+        }
+      } catch (e) {
+        log("close_warn", `Could not check liquidity state: ${e.message}`);
       }
-    } catch (e) {
-      log("close_warn", `Could not check liquidity state: ${e.message}`);
-    }
 
-    if (hasLiquidity) {
-      log("close", `Step 2: Removing liquidity and closing account`);
-      const closeTx = await pool.removeLiquidity({
-        user: wallet.publicKey,
-        position: positionPubKey,
-        fromBinId: closeFromBinId,
-        toBinId: closeToBinId,
-        bps: new BN(10000),
-        shouldClaimAndClose: true,
-      });
+      if (hasLiquidity) {
+        log("close", `Step 2: Removing liquidity and closing account`);
+        try {
+          const closeTx = await pool.removeLiquidity({
+            user: wallet.publicKey,
+            position: positionPubKey,
+            fromBinId: closeFromBinId,
+            toBinId: closeToBinId,
+            bps: new BN(10000),
+            shouldClaimAndClose: true,
+          });
 
-      for (const tx of Array.isArray(closeTx) ? closeTx : [closeTx]) {
-        const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet]);
-        closeTxHashes.push(txHash);
+          for (const tx of Array.isArray(closeTx) ? closeTx : [closeTx]) {
+            const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet]);
+            closeTxHashes.push(txHash);
+          }
+        } catch (e) {
+          closeTxError = e;
+          log("close_error", `removeLiquidity failed: ${e.message}`);
+        }
+      } else {
+        log("close", `Step 2: No position liquidity detected, closing account`);
+        try {
+          const closeTx = await pool.closePosition({
+            owner: wallet.publicKey,
+            position: { publicKey: positionPubKey },
+          });
+          const txHash = await sendAndConfirmTransaction(getConnection(), closeTx, [wallet]);
+          closeTxHashes.push(txHash);
+        } catch (e) {
+          closeTxError = e;
+          const msg = String(e.message || e);
+          if (msg.includes("AccountOwnedByWrongProgram") || msg.includes("3007")) {
+            positionAlreadyClosed = true;
+            log("close", `Position ${position_address} already closed on-chain (AccountOwnedByWrongProgram)`);
+          } else {
+            log("close_error", `closePosition failed: ${e.message}`);
+          }
+        }
       }
     } else {
-      log("close", `Step 2: No position liquidity detected, closing account`);
-      const closeTx = await pool.closePosition({
-        owner: wallet.publicKey,
-        position: { publicKey: positionPubKey },
-      });
-      const txHash = await sendAndConfirmTransaction(getConnection(), closeTx, [wallet]);
-      closeTxHashes.push(txHash);
+      log("close", `Skipping close tx — position ${position_address} already closed on-chain`);
     }
+
     const txHashes = [...claimTxHashes, ...closeTxHashes];
-    log("close", `Step 2 OK (close only): ${closeTxHashes.join(", ") || "none"}`);
-    log("close", `SUCCESS txs: ${txHashes.join(", ")}`);
+    if (closeTxHashes.length > 0) {
+      log("close", `Step 2 OK (close only): ${closeTxHashes.join(", ") || "none"}`);
+      log("close", `SUCCESS txs: ${txHashes.join(", ")}`);
+    }
     // Wait for RPC to reflect withdrawn balances before returning — prevents
     // agent from seeing zero balance when attempting post-close swap
     await new Promise(r => setTimeout(r, 5000));
     _positionsCacheAt = 0;
 
-    let closedConfirmed = false;
-    for (let attempt = 0; attempt < 4; attempt++) {
-      try {
-        const refreshed = await getMyPositions({ force: true, silent: true });
-        const stillOpen = refreshed?.positions?.some((p) => p.position === position_address);
-        if (!stillOpen) {
-          closedConfirmed = true;
-          break;
+    // Consider position closed if: already closed on-chain, or close tx sent, or verification confirms
+    let closedConfirmed = positionAlreadyClosed || closeTxHashes.length > 0;
+    if (!closedConfirmed) {
+      for (let attempt = 0; attempt < 4; attempt++) {
+        try {
+          const refreshed = await getMyPositions({ force: true, silent: true });
+          const stillOpen = refreshed?.positions?.some((p) => p.position === position_address);
+          if (!stillOpen) {
+            closedConfirmed = true;
+            break;
+          }
+          log("close_warn", `Position ${position_address} still appears open after close txs (attempt ${attempt + 1}/4)`);
+        } catch (e) {
+          log("close_warn", `Close verification failed (attempt ${attempt + 1}/4): ${e.message}`);
         }
-        log("close_warn", `Position ${position_address} still appears open after close txs (attempt ${attempt + 1}/4)`);
-      } catch (e) {
-        log("close_warn", `Close verification failed (attempt ${attempt + 1}/4): ${e.message}`);
+        if (attempt < 3) await new Promise((r) => setTimeout(r, 3000));
       }
-      if (attempt < 3) await new Promise((r) => setTimeout(r, 3000));
     }
 
-    if (!closedConfirmed) {
-      return {
-        success: false,
-        error: "Close transactions sent but position still appears open after verification window",
-        position: position_address,
-        pool: poolAddress,
-        claim_txs: claimTxHashes,
-        close_txs: closeTxHashes,
-        txs: txHashes,
-      };
-    }
+    // Mark position closed BEFORE swap-back to prevent state-sync race
+    recordClose(position_address, reason || "agent decision");
+    invalidatePositionCache();
 
     // ─── Post-close delta swap-back (close-swap integration) ───────
     let swapOutcome = null;
@@ -2032,12 +2124,30 @@ export async function closePosition({ position_address, reason }) {
           ambiguousUntil: swapResult.exposure.ambiguous ? new Date(Date.now() + 30 * 60 * 1000).toISOString() : null,
         });
         log("close_warn", `Post-close swap left exposure for ${baseMint}: ${swapResult.exposure.unsold_raw} raw unsold`);
+
+        // Record how much the agent actually sold so swap_guard knows
+        if (swapResult.swapOutcome?.success && swapResult.swapOutcome.sold_ui) {
+          const soldRaw = uiToRawAmount(swapResult.swapOutcome.sold_ui, swapResult.exposure.decimals);
+          recordAgentSoldExposure(position_address, swapResult.exposure.mint, soldRaw);
+          log("close", `Recorded agent sold ${swapResult.swapOutcome.sold_ui} ${baseMint.slice(0, 8)} for exposure tracking`);
+        }
+      } else if (swapResult.swapOutcome?.success && swapResult.swapOutcome.sold_ui) {
+        // Full success (no exposure), but create exposure entry with agent_sold_raw for swap_guard
+        recordCloseExposure({
+          position: position_address,
+          mint: baseMint,
+          preRaw: preRaw,
+          decimals: swapResult.exposure?.decimals ?? 9,
+          unsoldRaw: 0n,
+          ambiguousUntil: null,
+        });
+        const soldRaw = uiToRawAmount(swapResult.swapOutcome.sold_ui, swapResult.exposure?.decimals ?? 9);
+        recordAgentSoldExposure(position_address, baseMint, soldRaw);
+        log("close", `Recorded agent sold ${swapResult.swapOutcome.sold_ui} ${baseMint.slice(0, 8)} for exposure tracking (full success)`);
       }
     } catch (e) {
       log("close_warn", `Post-close swap error: ${e.message}`);
     }
-
-    recordClose(position_address, reason || "agent decision");
 
     // Record performance for learning
     if (tracked) {
@@ -2065,6 +2175,7 @@ export async function closePosition({ position_address, reason }) {
       let finalValueUsd = 0;
       let initialUsd = 0;
       let feesUsd = tracked.total_fees_claimed_usd || 0;
+      let positionFoundInClosedApi = false;
       try {
         const closedUrl = `https://dlmm.datapi.meteora.ag/positions/${poolAddress}/pnl?user=${wallet.publicKey.toString()}&status=closed&pageSize=50&page=1`;
         for (let attempt = 0; attempt < 6; attempt++) {
@@ -2073,6 +2184,7 @@ export async function closePosition({ position_address, reason }) {
             const data = await res.json();
             const posEntry = (data.positions || []).find(p => p.positionAddress === position_address);
             if (posEntry) {
+              positionFoundInClosedApi = true;
               const nextPnlUsd = safeNum(posEntry.pnlUsd);
               const nextPnlValue = config.management.solMode ? getClosedPnlValue(posEntry, true) : nextPnlUsd;
               const nextPnlPct = getClosedPnlPct(posEntry, config.management.solMode);
@@ -2101,8 +2213,13 @@ export async function closePosition({ position_address, reason }) {
       } catch (e) {
         log("close_warn", `Closed PnL fetch failed: ${e.message}`);
       }
-      // Fallback to pre-close cache snapshot if closed API had no data
-      if (finalValueUsd === 0) {
+      // If API gave us PnL but withdrawals not settled (finalValueUsd === 0), derive it
+      if (finalValueUsd === 0 && initialUsd > 0 && Number.isFinite(pnlUsd) && Number.isFinite(feesUsd)) {
+        finalValueUsd = Math.max(0, initialUsd + pnlUsd - feesUsd);
+        log("close", `Derived finalValueUsd from PnL: ${finalValueUsd.toFixed(2)} USD (initial=${initialUsd.toFixed(2)}, pnl=${pnlUsd.toFixed(2)}, fees=${feesUsd.toFixed(2)})`);
+      }
+      // Fallback to pre-close cache snapshot if closed API had no data (position not found)
+      if (!positionFoundInClosedApi) {
         const cachedPos = _positionsCache?.positions?.find(p => p.position === position_address);
         if (cachedPos) {
           pnlTrueUsd    = cachedPos.pnl_true_usd ?? (config.management.solMode ? 0 : cachedPos.pnl_usd) ?? 0;
@@ -2142,6 +2259,10 @@ export async function closePosition({ position_address, reason }) {
         }
       } catch { /* non-blocking */ }
 
+      const trackedPos = getTrackedPosition(position_address);
+      const max_pnl_pct = trackedPos?.peak_pnl_pct ?? null;
+      const max_drawdown_pct = trackedPos?.max_drawdown_pct ?? null;
+
       await recordPerformance({
         position: position_address,
         pool: poolAddress,
@@ -2165,6 +2286,8 @@ export async function closePosition({ position_address, reason }) {
         entry_tvl: tracked.entry_tvl ?? null,
         entry_volume: tracked.entry_volume ?? null,
         entry_holders: tracked.entry_holders ?? null,
+        max_pnl_pct,
+        max_drawdown_pct,
         ...exitMarket,
       });
 
@@ -2230,6 +2353,8 @@ export async function closePosition({ position_address, reason }) {
       swap_outcome: swapOutcome,
       exposure: exposureFlag ? "success_with_exposure" : null,
       reason: reason || "agent decision",
+      pnl_usd: fallbackPnl.pnlUsd,
+      pnl_pct: fallbackPnl.pnlPct,
     };
   } catch (error) {
     log("close_error", error.message);
@@ -2261,4 +2386,31 @@ async function lookupPoolForPosition(position_address, walletAddress) {
   }
 
   throw new Error(`Position ${position_address} not found in open positions`);
+}
+
+// Fetch closed position PnL from Meteora API for positions not tracked in state
+async function fetchFallbackPnl(poolAddress, position_address) {
+  let pnlUsd = 0;
+  let pnlPct = 0;
+  try {
+    const wallet = getWallet();
+    const closedUrl = `https://dlmm.datapi.meteora.ag/positions/${poolAddress}/pnl?user=${wallet.publicKey.toString()}&status=closed&pageSize=50&page=1`;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const res = await fetch(closedUrl);
+      if (res.ok) {
+        const data = await res.json();
+        const posEntry = (data.positions || []).find((p) => p.positionAddress === position_address);
+        if (posEntry) {
+          pnlUsd = safeNum(posEntry.pnlUsd);
+          pnlPct = getClosedPnlPct(posEntry, config.management.solMode);
+          log("close", `Fallback PnL from API: pnl=${pnlUsd.toFixed(2)} (${pnlPct.toFixed(2)}%)`);
+          break;
+        }
+      }
+      if (attempt < 2) await new Promise((r) => setTimeout(r, 3000));
+    }
+  } catch (e) {
+    log("close_warn", `Fallback PnL fetch failed: ${e.message}`);
+  }
+  return { pnlUsd, pnlPct };
 }
