@@ -11,13 +11,16 @@ import {
   getTrackedPositions,
 } from "../state.js";
 
-// ─── Public-infra PnL engine ───────────────────────────────────
-// Live position value (current liquidity + claimable fees) is read ON-CHAIN
-// via the Meteora DLMM SDK on a public RPC (pump.helius). Deposit history
-// (cost basis, withdrawals, claimed fees) comes ONLY from the Meteora /pnl
-// API — its precomputed live pnl/balances are intentionally ignored. Token
-// USD prices come from Jupiter. No LPAgent / agentmeridian dependency, so the
-// poller can run aggressively on fully public resources.
+// ─── Public-infra PnL engine (opt-in / emergency fallback) ──────
+// Default pnl.source is "meteora": the poller reads the full precomputed
+// data from the Meteora portfolio + /pnl APIs with no per-tick RPC reads.
+// This on-chain engine runs only when pnl.source=rpc or as the last-resort
+// fallback while the Meteora APIs are unreachable. Live position value
+// (current liquidity + claimable fees) is read ON-CHAIN via the Meteora DLMM
+// SDK on a public RPC (pump.helius). Deposit history (cost basis,
+// withdrawals, claimed fees) comes ONLY from the Meteora /pnl API — its
+// precomputed live pnl/balances are intentionally ignored here. Token USD
+// prices come from Jupiter. No LPAgent / agentmeridian dependency.
 
 const JUP_SEARCH = "https://datapi.jup.ag/v1/assets/search";
 const METEORA_PNL = "https://dlmm.datapi.meteora.ag/positions";

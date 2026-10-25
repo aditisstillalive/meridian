@@ -212,13 +212,14 @@ export const config = {
     lpAgentRelayEnabled: u.lpAgentRelayEnabled ?? false,
   },
 
-  // ─── PnL fetcher / poller (public infra: RPC + Meteora deposits + Jupiter) ──
+  // ─── PnL fetcher / poller (public infra: Meteora APIs) ──
   pnl: {
-    // Live position value comes from on-chain reads on this RPC.
-    // Defaults to the public pump.helius endpoint so the aggressive poller
-    // never burns the main RPC_URL or the LPAgent sponsor budget.
-    rpcUrl: nonEmptyString(u.pnlRpcUrl, process.env.PNL_RPC_URL, "https://pump.helius-rpc.com"),
-    source: nonEmptyString(u.pnlSource, "rpc"), // rpc | meteora (fallback-only)
+    // Position discovery, value, fees, and PnL come from the Meteora portfolio
+    // + /pnl APIs — no per-tick on-chain reads, so the poller stays cheap.
+    // "rpc" keeps the on-chain engine (DLMM SDK + Jupiter) available as an
+    // explicit opt-in.
+    rpcUrl: nonEmptyString(u.pnlRpcUrl, process.env.PNL_RPC_URL, process.env.RPC_URL, "https://api.mainnet-beta.solana.com"),
+    source: nonEmptyString(u.pnlSource, process.env.PNL_SOURCE, "meteora"), // meteora | rpc
     pollIntervalSec: Number(u.pnlPollIntervalSec ?? 3),
     depositCacheTtlSec: Number(u.pnlDepositCacheTtlSec ?? 300),
     // Consecutive confirming polls required before a peak is raised or an exit fires.
