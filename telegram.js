@@ -584,7 +584,7 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-function escapeHtml(text) {
+export function escapeHtml(text) {
   if (!text) return "";
   return String(text)
     .replace(/&/g, "\u0026\u0061\u006d\u0070\u003b")
