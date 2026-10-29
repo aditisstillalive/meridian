@@ -621,7 +621,7 @@ export async function deployPosition({
 
   // Read base fee directly from pool — baseFactor * binStep / 10^6 gives fee in %
   const baseFactor = pool.lbPair.parameters?.baseFactor ?? 0;
-  const actualBaseFee = base_fee ?? (baseFactor > 0 ? parseFloat((baseFactor * actualBinStep / 1e6 * 100).toFixed(4)) : null);
+  const actualBaseFee = base_fee ?? (baseFactor > 0 ? parseFloat((baseFactor * actualBinStep / 1e6).toFixed(4)) : null);
 
   const totalYLamports = new BN(Math.floor(finalAmountY * 1e9));
   // Token X amount uses mint decimals when available, falling back to 9.

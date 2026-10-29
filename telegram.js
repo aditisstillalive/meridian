@@ -130,7 +130,13 @@ async function postTelegram(method, body, attempt = 1) {
       }
       return null;
     }
-    return await res.json();
+    const json = await res.json();
+    // Successful sends are logged so delivery can be audited (failures already are)
+    if (method === "sendMessage") {
+      const preview = String(body.text ?? "").split("\n")[0].replace(/<[^>]+>/g, "").slice(0, 80);
+      log("telegram", `sendMessage OK message_id=${json?.result?.message_id ?? "?"}${attempt > 1 ? ` (attempt ${attempt})` : ""}: ${preview}`);
+    }
+    return json;
   } catch (e) {
     if (attempt < maxRetries && (e.name === 'AbortError' || e.message.includes('fetch failed') || e.message.includes('ENOTFOUND') || e.message.includes('ECONNREFUSED') || e.message.includes('ETIMEDOUT'))) {
       const delay = baseDelay * Math.pow(2, attempt - 1);
