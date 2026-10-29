@@ -28,7 +28,7 @@ import {
 } from "../state.js";
 import { recordPerformance } from "../lessons.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
-import { swapBackWithdrawnBase, expectedBaseWithdrawRaw, expectedClaimFeeRaw, getPnlTokenBalance } from "./close-swap.js";
+import { swapBackWithdrawnBase, expectedBaseWithdrawRaw, expectedClaimFeeRaw, getPnlTokenBalance, rawToUiString } from "./close-swap.js";
 import { getOnchainTokenBalance, getTokenUsdPrice, normalizeMint, uiToRawAmount } from "./wallet.js";
 import { appendDecision } from "../decision-log.js";
 import { agentMeridianJson, getAgentIdForRequests, getAgentMeridianHeaders } from "./agent-meridian.js";
@@ -1154,6 +1154,10 @@ async function processSyncedCloseSwaps(closedPositions) {
     try {
       const baseMint = pos.base_mint;
       if (!baseMint) continue;
+      if (_closingPositions.has(pos.position)) {
+        log("close", `State-sync close: skipping swap-back for ${pos.position} (closePosition in progress handles it)`);
+        continue;
+      }
 
       // Check if this position was already closed by the agent (normal close path)
       // which runs swap-back before marking closed. If so, skip to avoid double-swap.
@@ -1585,7 +1589,42 @@ export async function claimFees({ position_address }) {
 }
 
 // ─── Close Position ────────────────────────────────────────────
-export async function closePosition({ position_address, reason }) {
+// A close that fails partway (claim landed, removeLiquidity expired) can still move
+// base tokens into the wallet. Keep the first attempt's baseline so the retry's
+// delta swap-back includes them instead of treating them as pre-existing balance.
+const _unconfirmedCloseBaselines = new Map(); // position -> { mint, preRaw, at }
+const UNCONFIRMED_BASELINE_TTL_MS = 6 * 60 * 60 * 1000;
+
+function rememberUnconfirmedCloseBaseline(position, mint, preRaw) {
+  if (preRaw == null || _unconfirmedCloseBaselines.has(position)) return;
+  _unconfirmedCloseBaselines.set(position, { mint, preRaw, at: Date.now() });
+}
+
+function applyUnconfirmedCloseBaseline(position, mint, preRaw, expectedRaw) {
+  const prev = _unconfirmedCloseBaselines.get(position);
+  if (!prev || prev.mint !== mint || preRaw == null) return { preRaw, expectedRaw };
+  if (Date.now() - prev.at > UNCONFIRMED_BASELINE_TTL_MS || prev.preRaw >= preRaw) return { preRaw, expectedRaw };
+  const carried = preRaw - prev.preRaw;
+  log("close", `Carrying ${carried} raw ${mint.slice(0, 8)} withdrawn by an earlier unconfirmed close attempt into this close's swap-back`);
+  return { preRaw: prev.preRaw, expectedRaw: expectedRaw == null ? null : expectedRaw + carried };
+}
+
+// Positions with a closePosition call in flight. State sync can see such a position
+// vanish on-chain before the close records it, and its swap-back (baseline 0) would
+// then race the close's own delta swap-back for the same tokens.
+const _closingPositions = new Set();
+
+export async function closePosition(args) {
+  const position = normalizeMint(args?.position_address);
+  _closingPositions.add(position);
+  try {
+    return await closePositionInner(args);
+  } finally {
+    _closingPositions.delete(position);
+  }
+}
+
+async function closePositionInner({ position_address, reason }) {
   position_address = normalizeMint(position_address);
   if (process.env.DRY_RUN === "true") {
     return { dry_run: true, would_close: position_address, message: "DRY RUN — no transaction sent" };
@@ -1616,6 +1655,7 @@ export async function closePosition({ position_address, reason }) {
       } catch (e) {
         log("close_warn", `Pre-close balance snapshot failed: ${e.message}`);
       }
+      ({ preRaw, expectedRaw } = applyUnconfirmedCloseBaseline(position_address, baseMint, preRaw, expectedRaw));
 
       const relayAllowedDebitMints = [
         pool.lbPair.tokenXMint.toString(),
@@ -1703,6 +1743,7 @@ export async function closePosition({ position_address, reason }) {
       }
 
       if (!closedConfirmed) {
+        rememberUnconfirmedCloseBaseline(position_address, baseMint, preRaw);
         return {
           success: false,
           error: "Close submit succeeded but position still appears open after verification window",
@@ -1716,6 +1757,7 @@ export async function closePosition({ position_address, reason }) {
       // Mark position closed BEFORE swap-back to prevent state-sync race
       recordClose(position_address, reason || "agent decision");
       invalidatePositionCache();
+      _unconfirmedCloseBaselines.delete(position_address);
 
       // ─── Post-close delta swap-back (close-swap integration) ───────
       let swapOutcome = null;
@@ -1749,8 +1791,11 @@ export async function closePosition({ position_address, reason }) {
           // Record how much the agent actually sold so swap_guard knows
           if (swapResult.swapOutcome?.success && swapResult.swapOutcome.sold_ui) {
             const soldRaw = uiToRawAmount(swapResult.swapOutcome.sold_ui, swapResult.exposure.decimals);
-            recordAgentSoldExposure(position_address, swapResult.exposure.mint, soldRaw);
-            log("close", `Recorded agent sold ${swapResult.swapOutcome.sold_ui} ${baseMint.slice(0, 8)} for exposure tracking`);
+            // Only record excess sold against the exposure (unsoldOverExpectedRaw), not total sold
+            const excessSoldRaw = swapResult.exposure.unsold_raw != null ? BigInt(swapResult.exposure.unsold_raw) : 0n;
+            const agentSoldForExposure = soldRaw > excessSoldRaw ? soldRaw - excessSoldRaw : 0n;
+            recordAgentSoldExposure(position_address, swapResult.exposure.mint, agentSoldForExposure);
+            log("close", `Recorded agent sold ${rawToUiString(agentSoldForExposure, swapResult.exposure.decimals)} ${baseMint.slice(0, 8)} for exposure tracking (excess only)`);
           }
         } else if (swapResult.swapOutcome?.success && swapResult.swapOutcome.sold_ui) {
           // Full success (no exposure), but create exposure entry with agent_sold_raw for swap_guard
@@ -1976,6 +2021,7 @@ export async function closePosition({ position_address, reason }) {
         log("close_warn", `Pre-close balance snapshot failed: ${e.message}`);
       }
     }
+    ({ preRaw, expectedRaw } = applyUnconfirmedCloseBaseline(position_address, baseMint, preRaw, expectedRaw));
 
     const positionPubKey = new PublicKey(position_address);
     const claimTxHashes = [];
@@ -2110,9 +2156,24 @@ export async function closePosition({ position_address, reason }) {
       }
     }
 
+    if (!closedConfirmed) {
+      // Leave it tracked as open so stop-loss/rules keep applying and the next cycle retries.
+      log("close_error", `Close not confirmed for ${position_address} — keeping it open in state`);
+      rememberUnconfirmedCloseBaseline(position_address, baseMint, preRaw);
+      return {
+        success: false,
+        error: `Close not confirmed: position still appears open after verification window${closeTxError ? ` (${closeTxError.message})` : ""}`,
+        position: position_address,
+        pool: poolAddress,
+        claim_txs: claimTxHashes,
+        txs: txHashes,
+      };
+    }
+
     // Mark position closed BEFORE swap-back to prevent state-sync race
     recordClose(position_address, reason || "agent decision");
     invalidatePositionCache();
+    _unconfirmedCloseBaselines.delete(position_address);
 
     // ─── Post-close delta swap-back (close-swap integration) ───────
     let swapOutcome = null;

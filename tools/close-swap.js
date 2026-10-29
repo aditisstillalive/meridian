@@ -69,12 +69,9 @@ export async function getPnlTokenBalance(mint) {
   } catch (e) {
     log("wallet_warn", `getPnlTokenBalance ${mint} pnlRpc failed (${e.message}); falling back to main RPC`);
     // Fallback to main RPC via getOnchainTokenBalance
-    try {
-      return await getOnchainTokenBalance(mint);
-    } catch (e2) {
-      log("wallet_error", `getPnlTokenBalance ${mint} fallback failed: ${e2.message}`);
-      return { raw: 0n, decimals: 0, ui: "0" };
-    }
+    // Let a failed read throw: a fake 0 balance would shift the pre-close baseline
+    // (selling tokens that were already in the wallet) or hide the withdrawal.
+    return await getOnchainTokenBalance(mint);
   }
 }
 
@@ -92,8 +89,17 @@ export const RETRY_BACKOFF_MS = [0, 3000, 5000];
 
 // A price-impact refusal (wallet.js maxSwapPriceImpactPct) is terminal too: an
 // immediate retry would quote the same thin route.
-// "Insufficient funds" = route exists but not enough SOL liquidity for this amount.
-const TERMINAL_SWAP_ERROR = /no route|route not found|unsupported|invalid mint|mint not found|price impact|insufficient funds/i;
+const TERMINAL_SWAP_ERROR = /no route|route not found|unsupported|invalid mint|mint not found|price impact/i;
+// Jupiter "Insufficient funds" = its RPC sees less of the input token than we asked
+// to sell: either our balance read ran ahead of its view (retry), or the read was
+// stale and the tokens were already sold (stop).
+const INSUFFICIENT_FUNDS_ERROR = /insufficient funds/i;
+/** Re-read delays after a sale until the balance shows it (stale RPC reads re-sold already-sold tokens). */
+export const POST_SALE_READ_DELAYS_MS = [1500, 2000, 3000, 4000];
+
+async function readPnlOrOnchainBalance(mint) {
+  return (await getPnlTokenBalance(mint)) ?? getOnchainTokenBalance(mint);
+}
 
 /** Integer part of a BN / integer string / decimal string as a bigint, else null. */
 export function toRawBigInt(v) {
@@ -165,13 +171,14 @@ export function expectedBaseWithdrawRaw(pool, positionData, baseMint) {
  */
 export async function swapBackWithdrawnBase({ baseMint, symbol = null, preRaw, expectedRaw = null }, deps = {}) {
   // Use pnlRpcUrl for faster balance indexing; fall back to main RPC
-  const readBalance = deps.readBalance ?? getPnlTokenBalance ?? getOnchainTokenBalance;
+  const readBalance = deps.readBalance ?? readPnlOrOnchainBalance;
   const getPrice = deps.getPrice ?? getTokenUsdPrice;
   const swap = deps.swap ?? swapToken;
   const sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
   const log = deps.log ?? defaultLog;
   const pollDelays = deps.pollDelaysMs ?? POLL_DELAYS_MS;
   const retryBackoff = deps.retryBackoffMs ?? RETRY_BACKOFF_MS;
+  const postSaleDelays = deps.postSaleDelaysMs ?? POST_SALE_READ_DELAYS_MS;
   const label = symbol || baseMint.slice(0, 8);
   const txs = [];
 
@@ -207,16 +214,22 @@ export async function swapBackWithdrawnBase({ baseMint, symbol = null, preRaw, e
   let lastDelta = null;
   let unsoldOverExpectedRaw = 0n;
 
-  const readDelta = async (delays) => {
+  // balBelow: after a sale, only accept a read that shows the balance dropped below
+  // the pre-sale balance; an RPC that hasn't caught up would re-sell the same tokens.
+  const readDelta = async (delays, balBelow = null) => {
     let last = null;
     let err = null;
     for (const d of delays) {
       if (d) await sleep(d);
       try {
         const bal = await readBalance(baseMint);
+        if (balBelow != null && bal.raw >= balBelow) {
+          last = { stale: true };
+          continue;
+        }
         const delta = bal.raw > preRaw ? bal.raw - preRaw : 0n;
-        last = { delta, decimals: bal.decimals };
-        if (delta + soldRaw >= targetRaw) return last;
+        last = { delta, decimals: bal.decimals, balRaw: bal.raw };
+        if (balBelow != null || delta + soldRaw >= targetRaw) return last;
       } catch (e) {
         err = e;
       }
@@ -234,9 +247,17 @@ export async function swapBackWithdrawnBase({ baseMint, symbol = null, preRaw, e
   let dustSkipped = false;
   let ambiguous = false;
   let priceImpact = null; // { pct, cap, key } when the swap was refused on price impact
+  let balAtSale = null; // balance the last successful sale was sized from
 
   for (let i = 0; i < MAX_ATTEMPTS; i++) {
-    const r = await readDelta(i === 0 ? pollDelays : [retryBackoff[i] ?? 3000]);
+    const r = balAtSale != null
+      ? await readDelta(postSaleDelays, balAtSale)
+      : await readDelta(i === 0 ? pollDelays : [retryBackoff[i] ?? 3000]);
+    balAtSale = null;
+    if (r.stale) {
+      log("close_warn", `Post-close swap sold ${ui(soldRaw)} ${label} but the balance read never reflected the sale; not selling more on a stale read.`);
+      break;
+    }
     if (r.error) {
       attempts = i + 1;
       lastError = `balance read failed: ${r.error}`;
@@ -315,6 +336,7 @@ export async function swapBackWithdrawnBase({ baseMint, symbol = null, preRaw, e
       if (res.tx) txs.push(res.tx);
       soldRaw += sellRaw;
       succeeded = true;
+      balAtSale = r.balRaw ?? null;
       if (expectedKnown && soldRaw >= targetRaw) break;
       if (i === MAX_ATTEMPTS - 1) break;
       // Expected not reached yet (or unknown): re-read once more so a remove
@@ -334,6 +356,12 @@ export async function swapBackWithdrawnBase({ baseMint, symbol = null, preRaw, e
     if (res?.price_impact_refused) {
       priceImpact = { pct: res.price_impact_pct, cap: res.max_price_impact_pct, key: res.price_impact_cap_key };
       log("close_warn", `Post-close swap REFUSED on price impact: ${res.price_impact_pct}% > ${res.price_impact_cap_key ?? "cap"} ${res.max_price_impact_pct}% for ${sellUi} ${label}; leaving it as exposure (success_with_exposure). Raise maxCloseSwapPriceImpactPct or sell manually.`);
+      break;
+    }
+    if (INSUFFICIENT_FUNDS_ERROR.test(lastError) && soldRaw > 0n) {
+      // The earlier sale already took these tokens; the read we sized this one from was stale.
+      log("close", `Post-close swap: ${label} remainder already gone (sold ${ui(soldRaw)}), treating as done.`);
+      succeeded = true;
       break;
     }
     if (TERMINAL_SWAP_ERROR.test(lastError)) {
@@ -445,25 +473,29 @@ export async function sweepStrandedExposure(deps = {}) {
   const state = loadState();
   const exposures = state.close_exposure || [];
   const now = Date.now();
-  const windowMs = 2 * 60 * 60 * 1000; // 2 hours (same as CLOSE_EXPOSURE_WINDOW_MS)
+  const windowMs = 48 * 60 * 60 * 1000; // 48 hours (matches close_exposure pruning window)
   const cutoff = now - windowMs;
 
   const dustUsd = Number(config.management.closeSwapDustUsd ?? 0.05);
   const swept = [];
   const errors = [];
+  const seenMints = new Set();
 
-  for (const exp of exposures) {
+  // Newest first: one sale per mint per run, against the latest close's baseline;
+  // a second entry for the same mint would size off a balance read that may not
+  // reflect the first sale yet.
+  const ordered = [...exposures].sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+  for (const exp of ordered) {
     if (new Date(exp.created_at).getTime() < cutoff) continue;
     if (exp.ambiguous_until && new Date(exp.ambiguous_until).getTime() > now) continue;
+    // Unknown pre-close balance: nothing is attributable, never sell the whole balance.
+    if (exp.pre_raw == null) continue;
 
     const mint = exp.mint;
+    if (seenMints.has(mint)) continue;
+    seenMints.add(mint);
     const decimals = exp.decimals;
-    const preRaw = BigInt(exp.pre_raw ?? 0);
-    const unsoldRaw = BigInt(exp.unsold_raw ?? 0);
-    const agentSoldRaw = BigInt(exp.agent_sold_raw ?? 0);
-    const sellableRaw = unsoldRaw - agentSoldRaw;
-
-    if (sellableRaw <= 0n) continue;
+    const preRaw = BigInt(exp.pre_raw);
 
     // Check on-chain balance above pre-close
     let bal;
@@ -476,14 +508,13 @@ export async function sweepStrandedExposure(deps = {}) {
     const aboveRaw = bal.raw > preRaw ? bal.raw - preRaw : 0n;
     if (aboveRaw <= 0n) continue;
 
-    const sellRaw = aboveRaw < sellableRaw ? aboveRaw : sellableRaw;
+    const sellRaw = aboveRaw;
     const sellUi = rawToUiString(sellRaw, decimals);
 
     // Dust gate
     const price = await getPrice(mint);
     const sellUsd = price != null ? Number(sellUi) * price : null;
     if (sellUsd != null && sellUsd < dustUsd) {
-      log("close", `Sweep: leaving ${sellUi} ${mint.slice(0, 8)} (~$${sellUsd.toFixed(4)}), under $${dustUsd.toFixed(2)} dust gate`);
       continue;
     }
 
@@ -494,7 +525,7 @@ export async function sweepStrandedExposure(deps = {}) {
       if (res?.success) {
         log("close", `Sweep: sold ${sellUi} ${mint.slice(0, 8)} -> SOL, tx: ${res.tx}`);
         swept.push({ mint, sold_ui: sellUi, tx: res.tx });
-        // Update agent_sold_raw in state
+        // Update agent_sold_raw in state (track total sold against this exposure)
         recordAgentSoldExposure(exp.position, mint, sellRaw);
       } else {
         const err = res?.error || "unknown";

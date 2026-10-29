@@ -143,6 +143,20 @@ export async function recordPerformance(perf) {
     recorded_at: new Date().toISOString(),
   };
 
+  // A position can reach here twice (e.g. a close that wasn't confirmed on-chain,
+  // then the real close). Keep one record per position — the latest wins, since the
+  // earlier one may hold unsettled numbers — and skip lesson/memory/evolve side effects.
+  const existingIdx = perf.position
+    ? data.performance.findIndex((p) => p.position === perf.position)
+    : -1;
+  if (existingIdx !== -1) {
+    const prev = data.performance[existingIdx];
+    data.performance[existingIdx] = entry;
+    save(data);
+    log("lessons_warn", `Duplicate performance record for ${perf.pool_name || perf.position}: replaced pnl_usd ${prev.pnl_usd} → ${entry.pnl_usd}`);
+    return;
+  }
+
   data.performance.push(entry);
 
   // Derive and store a lesson
