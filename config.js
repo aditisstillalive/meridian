@@ -120,6 +120,7 @@ export const config = {
     outOfRangeUpWaitMinutes: u.outOfRangeUpWaitMinutes ?? null,
     // Hold OOR position if PnL >= this threshold (0 = disabled)
     oorProfitHoldMinPct: u.oorProfitHoldMinPct ?? 0,
+    oorProfitHoldEnabled: u.oorProfitHoldEnabled ?? true,
     oorCooldownTriggerCount: u.oorCooldownTriggerCount ?? 3,
     oorCooldownHours:       u.oorCooldownHours       ?? 12,
     repeatDeployCooldownEnabled: u.repeatDeployCooldownEnabled ?? true,
@@ -169,6 +170,12 @@ export const config = {
     recoveryExitMaxBinDrop: u.recoveryExitMaxBinDrop ?? 2,
     // Close any position held this long (minutes); 0/null disables
     maxHoldMinutes: u.maxHoldMinutes ?? 0,
+    // Keep running past maxHold while profitable or healthy (in range + fee/TVL >= minFeePerTvl24h + PnL above floor)
+    maxHoldExtendEnabled: u.maxHoldExtendEnabled ?? false,
+    maxHoldExtendMinPnlPct: u.maxHoldExtendMinPnlPct ?? 1,
+    maxHoldExtendMinHealthyPnlPct: u.maxHoldExtendMinHealthyPnlPct ?? -2,
+    // Hard cap: never extend past maxHoldMinutes × this
+    maxHoldExtendMaxMult: u.maxHoldExtendMaxMult ?? 2,
   },
 
   // ─── Strategy Mapping ───────────────────

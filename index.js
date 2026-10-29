@@ -27,7 +27,7 @@ import {
 } from "./telegram.js";
 import { resetLiveMessageDepth } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, confirmPeak, registerExitSignal, getOorWaitMinutes } from "./state.js";
+import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, confirmPeak, registerExitSignal, getOorWaitMinutes, isOorProfitHold, getMaxHoldExtension } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
@@ -998,6 +998,8 @@ function formatCandidates(candidates) {
   ].join("\n");
 }
 
+const _maxHoldExtendLogged = new Set(); // log each extension once, not every PnL poll tick
+
 function getDeterministicCloseRule(position, managementConfig) {
   const tracked = getTrackedPosition(position.position);
   const pnlSuspect = (() => {
@@ -1031,9 +1033,7 @@ function getDeterministicCloseRule(position, managementConfig) {
     position.active_bin > position.upper_bin &&
     (position.minutes_out_of_range ?? 0) >= getOorWaitMinutes(managementConfig, position)
   ) {
-    const holdThresh = managementConfig.oorProfitHoldMinPct ?? 0;
-    const oorProfitable = holdThresh > 0 && position.pnl_pct != null && position.pnl_pct >= holdThresh;
-    if (!oorProfitable) {
+    if (!isOorProfitHold(managementConfig, pnlSuspect ? null : position.pnl_pct)) {
       return { action: "CLOSE", rule: 4, reason: "OOR" };
     }
   }
@@ -1066,6 +1066,14 @@ function getDeterministicCloseRule(position, managementConfig) {
     const ageMin = position.age_minutes ??
       (tracked?.deployed_at ? Math.floor((Date.now() - new Date(tracked.deployed_at).getTime()) / 60000) : null);
     if (ageMin != null && ageMin >= maxHold) {
+      const extension = getMaxHoldExtension(managementConfig, position, ageMin, pnlSuspect);
+      if (extension) {
+        if (!_maxHoldExtendLogged.has(position.position)) {
+          _maxHoldExtendLogged.add(position.position);
+          log("cron", `Max hold extended for ${position.pair} (${ageMin}m): ${extension}`);
+        }
+        return null;
+      }
       return { action: "CLOSE", rule: 7, reason: `max hold: ${ageMin}m >= ${maxHold}m` };
     }
   }

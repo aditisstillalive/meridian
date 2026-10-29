@@ -373,6 +373,37 @@ export function getOorWaitMinutes(mgmtConfig, positionData) {
     : mgmtConfig.outOfRangeWaitMinutes;
 }
 
+/** OOR positions at or above oorProfitHoldMinPct are held instead of closed. */
+export function isOorProfitHold(mgmtConfig, pnlPct) {
+  if (mgmtConfig.oorProfitHoldEnabled === false) return false;
+  const holdThresh = Number(mgmtConfig.oorProfitHoldMinPct) || 0;
+  return holdThresh > 0 && pnlPct != null && pnlPct >= holdThresh;
+}
+
+/**
+ * Why a position past maxHoldMinutes may keep running (null = close it).
+ * Extends while profitable OR still healthy (in range, earning fees, PnL above floor),
+ * up to maxHoldMinutes × maxHoldExtendMaxMult.
+ */
+export function getMaxHoldExtension(mgmtConfig, positionData, ageMin, pnlSuspect = false) {
+  if (!mgmtConfig.maxHoldExtendEnabled) return null;
+  const maxHold = Number(mgmtConfig.maxHoldMinutes) || 0;
+  const mult = Number(mgmtConfig.maxHoldExtendMaxMult) || 1;
+  if (maxHold <= 0 || ageMin >= maxHold * mult) return null;
+  const pnl = pnlSuspect ? null : positionData.pnl_pct;
+  if (pnl == null) return null;
+  if (pnl >= mgmtConfig.maxHoldExtendMinPnlPct) return `profit ${pnl.toFixed(2)}%`;
+  const fee = positionData.fee_per_tvl_24h;
+  if (
+    positionData.in_range &&
+    fee != null && fee >= mgmtConfig.minFeePerTvl24h &&
+    pnl >= mgmtConfig.maxHoldExtendMinHealthyPnlPct
+  ) {
+    return `healthy: in range, fee/TVL ${fee}%, PnL ${pnl.toFixed(2)}%`;
+  }
+  return null;
+}
+
 export function updatePnlAndCheckExits(position_address, positionData, mgmtConfig) {
   const { pnl_pct: currentPnlPct, pnl_pct_suspicious, in_range, fee_per_tvl_24h } = positionData;
   const state = load();
@@ -440,8 +471,7 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
     const minutesOOR = Math.floor((Date.now() - new Date(pos.out_of_range_since).getTime()) / 60000);
     const oorWait = getOorWaitMinutes(mgmtConfig, positionData);
     if (minutesOOR >= oorWait) {
-      const holdThresh = mgmtConfig.oorProfitHoldMinPct ?? 0;
-      if (!(holdThresh > 0 && currentPnlPct != null && currentPnlPct >= holdThresh)) {
+      if (!isOorProfitHold(mgmtConfig, currentPnlPct)) {
         oorExit = {
           action: "OUT_OF_RANGE",
           reason: `Out of range for ${minutesOOR}m (limit: ${oorWait}m)`,

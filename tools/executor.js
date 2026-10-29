@@ -394,6 +394,7 @@ const toolMap = {
       outOfRangeWaitMinutes: ["management", "outOfRangeWaitMinutes"],
       outOfRangeUpWaitMinutes: ["management", "outOfRangeUpWaitMinutes"],
       oorProfitHoldMinPct: ["management", "oorProfitHoldMinPct"],
+      oorProfitHoldEnabled: ["management", "oorProfitHoldEnabled"],
       oorCooldownTriggerCount: ["management", "oorCooldownTriggerCount"],
       oorCooldownHours: ["management", "oorCooldownHours"],
       repeatDeployCooldownEnabled: ["management", "repeatDeployCooldownEnabled"],
@@ -420,6 +421,10 @@ const toolMap = {
       recoveryExitConfirmTicks: ["management", "recoveryExitConfirmTicks"],
       recoveryExitMaxBinDrop: ["management", "recoveryExitMaxBinDrop"],
       maxHoldMinutes: ["management", "maxHoldMinutes"],
+      maxHoldExtendEnabled: ["management", "maxHoldExtendEnabled"],
+      maxHoldExtendMinPnlPct: ["management", "maxHoldExtendMinPnlPct"],
+      maxHoldExtendMinHealthyPnlPct: ["management", "maxHoldExtendMinHealthyPnlPct"],
+      maxHoldExtendMaxMult: ["management", "maxHoldExtendMaxMult"],
       // pnl poller
       pnlConfirmTicks: ["pnl", "confirmTicks"],
       // opportunity poller (interval/enabled changes apply on next restart)
