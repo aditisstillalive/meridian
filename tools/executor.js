@@ -20,7 +20,7 @@ import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-bla
 import { blockDev, unblockDev, listBlockedDevs } from "../dev-blocklist.js";
 import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
-import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW } from "../config.js";
+import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW, getMinDeployAmount } from "../config.js";
 import { getRecentDecisions } from "../decision-log.js";
 import fs from "fs";
 import { execSync, spawn } from "child_process";
@@ -176,6 +176,12 @@ async function validateDeployPoolThresholds(args) {
   return { pass: true, entryMarketData };
 }
 
+// Per-pool deploy amounts planned by the screening cycle (confidence sizing).
+// When set, deploy_position for that pool is forced to the planned amount so the LLM can't resize it.
+let _plannedDeployAmounts = new Map();
+export function setPlannedDeployAmounts(map) { _plannedDeployAmounts = new Map(map || []); }
+export function clearPlannedDeployAmounts() { _plannedDeployAmounts = new Map(); }
+
 // Registered by index.js so update_config can restart cron jobs when intervals change
 let _cronRestarter = null;
 export function registerCronRestarter(fn) { _cronRestarter = fn; }
@@ -218,6 +224,7 @@ function normalizeConfigValue(key, value) {
     "solMode",
     "darwinEnabled",
     "lpAgentRelayEnabled",
+    "confidenceSizingEnabled",
   ]);
   const arrayKeys = new Set(["allowedLaunchpads", "blockedLaunchpads"]);
   const stringKeys = new Set([
@@ -429,6 +436,13 @@ const toolMap = {
       deployAmountSol: ["management", "deployAmountSol"],
       gasReserve: ["management", "gasReserve"],
       positionSizePct: ["management", "positionSizePct"],
+      confidenceSizingEnabled: ["management", "confidenceSizingEnabled"],
+      confidenceSizingHighOrganic: ["management", "confidenceSizingHighOrganic"],
+      confidenceSizingStartHourUtc: ["management", "confidenceSizingStartHourUtc"],
+      confidenceSizingEndHourUtc: ["management", "confidenceSizingEndHourUtc"],
+      confidenceSizingLowMult: ["management", "confidenceSizingLowMult"],
+      confidenceSizingMidMult: ["management", "confidenceSizingMidMult"],
+      confidenceSizingHighMult: ["management", "confidenceSizingHighMult"],
       minAgeBeforeYieldCheck: ["management", "minAgeBeforeYieldCheck"],
       // risk
       maxPositions: ["risk", "maxPositions"],
@@ -719,6 +733,15 @@ async function runSafetyChecks(name, args) {
         };
       }
 
+      const planned = _plannedDeployAmounts.get(args.pool_address);
+      if (planned != null) {
+        const requested = Number(args.amount_y ?? args.amount_sol ?? 0);
+        if (requested !== planned) {
+          log("safety", `deploy_position amount ${requested} SOL overridden to planned confidence-sized ${planned} SOL`);
+        }
+        args.amount_y = args.amount_sol = planned;
+      }
+
       const deployAmountY = Number(args.amount_y ?? args.amount_sol ?? 0);
       const deployAmountX = Number(args.amount_x ?? 0);
       if (Number.isFinite(deployAmountX) && deployAmountX > 0) {
@@ -818,7 +841,7 @@ async function runSafetyChecks(name, args) {
         };
       }
 
-      const minDeploy = Math.max(0.1, config.management.deployAmountSol);
+      const minDeploy = getMinDeployAmount();
       if (amountY < minDeploy) {
         return {
           pass: false,

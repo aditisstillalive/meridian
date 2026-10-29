@@ -134,6 +134,15 @@ export const config = {
     deployAmountSol:       u.deployAmountSol       ?? 0.5,
     gasReserve:            u.gasReserve            ?? 0.2,
     positionSizePct:       u.positionSizePct       ?? 0.35,
+    // Confidence-based sizing — multiplier on computeDeployAmount from a deterministic score:
+    // +1 if organic >= confidenceSizingHighOrganic, +1 if deploying inside the UTC hour window
+    confidenceSizingEnabled:      u.confidenceSizingEnabled      ?? false,
+    confidenceSizingHighOrganic:  u.confidenceSizingHighOrganic  ?? 76,
+    confidenceSizingStartHourUtc: u.confidenceSizingStartHourUtc ?? 0,   // inclusive
+    confidenceSizingEndHourUtc:   u.confidenceSizingEndHourUtc   ?? 12,  // exclusive
+    confidenceSizingLowMult:      u.confidenceSizingLowMult      ?? 0.5, // score 0
+    confidenceSizingMidMult:      u.confidenceSizingMidMult      ?? 1,   // score 1
+    confidenceSizingHighMult:     u.confidenceSizingHighMult     ?? 1.2, // score 2
     // Trailing take-profit
     trailingTakeProfit:    u.trailingTakeProfit    ?? true,
     trailingTriggerPct:    u.trailingTriggerPct    ?? 3,    // activate trailing at X% PnL
@@ -304,15 +313,67 @@ export const config = {
  *   3.0 SOL wallet → 0.98 SOL deploy
  *   4.0 SOL wallet → 1.33 SOL deploy
  */
-export function computeDeployAmount(walletSol) {
+export function computeDeployAmount(walletSol, { multiplier = 1 } = {}) {
   const reserve  = config.management.gasReserve      ?? 0.2;
   const pct      = config.management.positionSizePct ?? 0.35;
   const floor    = config.management.deployAmountSol;
   const ceil     = config.risk.maxDeployAmount;
   const deployable = Math.max(0, walletSol - reserve);
   const dynamic    = deployable * pct;
-  const result     = Math.min(ceil, Math.max(floor, dynamic));
+  const base       = Math.min(ceil, Math.max(floor, dynamic));
+  // Multiplier may take the size below the floor (low confidence) but never above the ceiling
+  const result     = Math.max(MIN_DEPLOY_SOL, Math.min(ceil, base * multiplier));
   return parseFloat(result.toFixed(2));
+}
+
+const MIN_DEPLOY_SOL = 0.1;
+const clampMult = (v, fallback) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.min(2, Math.max(0.1, n)) : fallback;
+};
+
+function confidenceMultipliers() {
+  const m = config.management;
+  return [
+    clampMult(m.confidenceSizingLowMult, 0.5),
+    clampMult(m.confidenceSizingMidMult, 1),
+    clampMult(m.confidenceSizingHighMult, 1.2),
+  ];
+}
+
+/**
+ * Deterministic confidence score (0-2) → size multiplier.
+ * Derived from closed-position stats (2026-10-27): organic >= 76 and deploys
+ * between 00-12 UTC had markedly fewer stop-losses. Returns multiplier 1 when disabled.
+ */
+export function computeConfidenceSizing({ organicScore, now = new Date() } = {}) {
+  const m = config.management;
+  if (!m.confidenceSizingEnabled) return { enabled: false, score: null, multiplier: 1, reasons: [] };
+
+  const reasons = [];
+  let score = 0;
+  const organic = Number(organicScore);
+  if (organicScore != null && Number.isFinite(organic) && organic >= Number(m.confidenceSizingHighOrganic ?? 76)) {
+    score++;
+    reasons.push(`organic ${organic}>=${m.confidenceSizingHighOrganic}`);
+  }
+  const hour = now.getUTCHours();
+  const start = Number(m.confidenceSizingStartHourUtc ?? 0);
+  const end = Number(m.confidenceSizingEndHourUtc ?? 12);
+  const inWindow = start <= end ? hour >= start && hour < end : hour >= start || hour < end;
+  if (inWindow) {
+    score++;
+    reasons.push(`hour ${hour}UTC in ${start}-${end}`);
+  }
+  return { enabled: true, score, multiplier: confidenceMultipliers()[score], reasons };
+}
+
+/** Smallest amount the deploy safety check should accept, accounting for confidence downsizing. */
+export function getMinDeployAmount() {
+  const floor = config.management.deployAmountSol;
+  if (!config.management.confidenceSizingEnabled) return Math.max(MIN_DEPLOY_SOL, floor);
+  const lowest = Math.min(1, ...confidenceMultipliers());
+  return Math.max(MIN_DEPLOY_SOL, parseFloat((floor * lowest).toFixed(2)) - 0.005);
 }
 
 /**

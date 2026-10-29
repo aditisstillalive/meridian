@@ -9,9 +9,9 @@ import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates, degenScore } from "./tools/screening.js";
 import { sweepStrandedExposure } from "./tools/close-swap.js";
-import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
+import { config, reloadScreeningThresholds, computeDeployAmount, computeConfidenceSizing } from "./config.js";
 import { evolveThresholds, getPerformanceSummary } from "./lessons.js";
-import { executeTool, registerCronRestarter } from "./tools/executor.js";
+import { executeTool, registerCronRestarter, setPlannedDeployAmounts, clearPlannedDeployAmounts } from "./tools/executor.js";
 import {
   startPolling,
   stopPolling,
@@ -579,6 +579,19 @@ export async function runScreeningCycle({ silent = false } = {}) {
       passing.map(({ pool }) => getActiveBin({ pool_address: pool.pool }))
     );
 
+    // Confidence sizing: per-candidate amount, enforced in executor via planned amounts
+    const sizingEnabled = Boolean(config.management.confidenceSizingEnabled);
+    const plannedAmounts = new Map();
+    const sizingLines = passing.map(({ pool }) => {
+      if (!sizingEnabled) return null;
+      const sizing = computeConfidenceSizing({ organicScore: pool.organic_score });
+      const amount = computeDeployAmount(currentBalance.sol, { multiplier: sizing.multiplier });
+      plannedAmounts.set(pool.pool, amount);
+      log("cron", `Confidence sizing ${pool.name}: score ${sizing.score} → ×${sizing.multiplier} = ${amount} SOL (${sizing.reasons.join(", ") || "no boosts"})`);
+      return `  deploy_amount: ${amount} SOL (confidence score ${sizing.score}/2, ×${sizing.multiplier})`;
+    });
+    setPlannedDeployAmounts(plannedAmounts);
+
     // Build compact candidate blocks
     const candidateBlocks = passing.map(({ pool, sw, n, ti, mem }, i) => {
       const botPct = ti?.audit?.bot_holders_pct ?? "?";
@@ -597,6 +610,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
         `POOL: ${pool.name} (${pool.pool})`,
         `  metrics: bin_step=${pool.bin_step}, fee_pct=${pool.fee_pct}%, fee_tvl=${pool.fee_active_tvl_ratio}, vol=$${pool.volume_window}, tvl=$${pool.tvl ?? pool.active_tvl}, volatility_${pool.volatility_timeframe || "30m"}=${pool.volatility}, mcap=$${pool.mcap}, organic=${pool.organic_score}${pool.token_age_hours != null ? `, age=${pool.token_age_hours}h` : ""}`,
         `  audit: top10=${top10Pct}%, bots=${botPct}%, fees=${feesSol}SOL${launchpad ? `, launchpad=${launchpad}` : ""}`,
+        sizingLines[i],
         pvpLine,
         `  smart_wallets: ${sw?.in_pool?.length ?? 0} present${sw?.in_pool?.length ? ` → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})` : ""}`,
         activeBin != null ? `  active_bin: ${activeBin}` : null,
@@ -631,7 +645,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     const { content } = await agentLoop(`
 SCREENING CYCLE
 ${strategyBlock}
-Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | SOL: ${currentBalance.sol.toFixed(3)} | Deploy: ${deployAmount} SOL
+Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | SOL: ${currentBalance.sol.toFixed(3)} | Deploy: ${sizingEnabled ? "use the candidate's deploy_amount (enforced)" : `${deployAmount} SOL`}
 
 PRE-LOADED CANDIDATES (${passing.length} pools):
 ${candidateBlocks.join("\n\n")}
@@ -726,6 +740,7 @@ IMPORTANT:
     log("cron_error", `Screening cycle failed: ${error.message}`);
     screenReport = `Screening cycle failed: ${error.message}`;
   } finally {
+    clearPlannedDeployAmounts();
     _screeningBusy = false;
     if (!silent && telegramEnabled() && !config.management.notifSuppress) {
       if (screenReport) {
@@ -1475,7 +1490,9 @@ async function deployLatestCandidate(index) {
       throw new Error(`NO DEPLOY: only cached candidate ${candidate.name} is not worth deploying — ${skipReason}`);
     }
   }
-  const deployAmount = computeDeployAmount((await getWalletBalances()).sol);
+  const sizing = computeConfidenceSizing({ organicScore: candidate.organic_score });
+  const deployAmount = computeDeployAmount((await getWalletBalances()).sol, { multiplier: sizing.multiplier });
+  if (sizing.enabled) log("deploy", `Confidence sizing ${candidate.name}: score ${sizing.score} → ×${sizing.multiplier} = ${deployAmount} SOL`);
   const binsBelow = computeBinsBelow(candidate.volatility);
   const result = await executeTool("deploy_position", {
     pool_address: candidate.pool,
