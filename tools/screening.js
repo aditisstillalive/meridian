@@ -451,7 +451,7 @@ async function refreshDiscordOnlyPools(pools, timeframe) {
  * Returns condensed data optimized for LLM consumption (saves tokens).
  */
 export async function discoverPools({
-  page_size = 50,
+  page_size = 200,
 } = {}) {
   const s = config.screening;
   const filters = [
@@ -460,17 +460,12 @@ export async function discoverPools({
     s.excludeHighSupplyConcentration ? "base_token_has_high_supply_concentration=false" : null,
     "base_token_has_high_single_ownership=false",
     "pool_type=dlmm",
-    `base_token_market_cap>=${s.minMcap}`,
-    `base_token_market_cap<=${s.maxMcap}`,
-    `base_token_holders>=${s.minHolders}`,
     `volume>=${s.minVolume}`,
     `tvl>=${s.minTvl}`,
     s.maxTvl != null ? `tvl<=${s.maxTvl}` : null,
-    `dlmm_bin_step>=${s.minBinStep}`,
-    `dlmm_bin_step<=${s.maxBinStep}`,
+    `bin_step>=${s.minBinStep}`,
+    `bin_step<=${s.maxBinStep}`,
     `fee_active_tvl_ratio>=${s.minFeeActiveTvlRatio}`,
-    `base_token_organic_score>=${s.minOrganic}`,
-    `quote_token_organic_score>=${s.minQuoteOrganic}`,
     s.minTokenAgeHours != null ? `base_token_created_at<=${Date.now() - s.minTokenAgeHours * 3_600_000}` : null,
     s.maxTokenAgeHours != null ? `base_token_created_at>=${Date.now() - s.maxTokenAgeHours * 3_600_000}` : null,
     Array.isArray(s.allowedLaunchpads) && s.allowedLaunchpads.length > 0
