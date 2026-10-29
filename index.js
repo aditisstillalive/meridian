@@ -189,6 +189,31 @@ async function executeManagementActions(actionPositions, actionMap, { liveMessag
 
     if (act.action === "CLOSE") {
       const reason = act.reason || (act.rule ? `Rule ${act.rule}` : "rule close");
+      
+      // Pre-execution PnL verification for recovery exits (rule 6)
+      if (act.rule === 6 && config.management.recoveryExitEnabled) {
+        const { getPositionPnl } = await import("./tools/dlmm.js");
+        const freshPnl = await getPositionPnl({ pool_address: p.pool, position_address: p.position }).catch(() => null);
+        const currentPnlPct = freshPnl?.pnl_pct ?? p.pnl_pct;
+        if (currentPnlPct != null && currentPnlPct < config.management.recoveryExitTriggerPct) {
+          log("state", `Recovery exit cancelled for ${p.pair}: PnL dropped to ${currentPnlPct.toFixed(2)}% (was ${p.pnl_pct.toFixed(2)}%), below trigger ${config.management.recoveryExitTriggerPct}%`);
+          lines.push(`${p.pair}: recovery exit CANCELLED — PnL dropped to ${currentPnlPct.toFixed(2)}% < ${config.management.recoveryExitTriggerPct}%`);
+          continue;
+        }
+        // The fresh PnL above comes from the same Meteora API that produced the trigger,
+        // so it can't catch a wick that already reverted. Cross-check the on-chain active bin.
+        const maxBinDrop = Number(config.management.recoveryExitMaxBinDrop ?? 2);
+        if (p.active_bin != null) {
+          const onchain = await getActiveBin({ pool_address: p.pool }).catch(() => null);
+          const binDrop = onchain?.binId != null ? p.active_bin - onchain.binId : null;
+          if (binDrop != null && binDrop >= maxBinDrop) {
+            log("state", `Recovery exit cancelled for ${p.pair}: on-chain active bin ${onchain.binId} is ${binDrop} bins below trigger tick bin ${p.active_bin} — spike already reverted`);
+            lines.push(`${p.pair}: recovery exit CANCELLED — price reverted ${binDrop} bins since trigger`);
+            continue;
+          }
+        }
+      }
+      
       await liveMessage?.toolStart("close_position");
       const res = await executeTool("close_position", { position_address: p.position, reason }).catch(e => ({ error: e.message }));
       const ok = res?.success !== false && !res?.error && !res?.blocked;
@@ -776,10 +801,16 @@ Summarize the current portfolio health, total fees earned, and performance of al
         else if (closeRule) { signal = `RULE_${closeRule.rule}`; reason = closeRule.reason; rule = closeRule.rule; }
 
         // Require N consecutive confirming ticks before acting.
-        const { fire } = registerExitSignal(p.position, signal, confirmTicks);
+        // Recovery exits trigger on a bounce off a drawdown — often a short wick — so they
+        // need to hold longer than stop-loss / trailing exits before we act.
+        const ticksNeeded = signal === "RULE_6"
+          ? Math.max(confirmTicks, Number(config.management.recoveryExitConfirmTicks ?? 4))
+          : confirmTicks;
+        const { fire, count } = registerExitSignal(p.position, signal, ticksNeeded);
+        if (signal) log("state", `[PnL poll] ${signal} tick ${count}/${ticksNeeded}: ${p.pair} pnl_pct=${p.pnl_pct}% value=${p.total_value_usd ?? "?"} unclaimed=${p.unclaimed_fees_usd ?? "?"}`);
         if (!signal || !fire) continue;
 
-        log("state", `[PnL poll] ${signal} confirmed (${confirmTicks} ticks): ${p.pair} — ${reason} — closing directly`);
+        log("state", `[PnL poll] ${signal} confirmed (${ticksNeeded} ticks): ${p.pair} — ${reason} — closing directly`);
         // Hold the management lock so the cron cycle can't double-act on this position.
         _managementBusy = true;
         try {

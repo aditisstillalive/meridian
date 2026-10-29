@@ -152,6 +152,10 @@ export const config = {
     recoveryExitEnabled: u.recoveryExitEnabled ?? true,
     recoveryExitTriggerPct: u.recoveryExitTriggerPct ?? 1,
     recoveryExitMinDD: u.recoveryExitMinDD ?? 8,
+    // Recovery exits fire right after a bounce, so require a longer confirmation than other exits
+    recoveryExitConfirmTicks: u.recoveryExitConfirmTicks ?? 4,
+    // Cancel a recovery exit if the on-chain active bin is this many bins below the triggering tick
+    recoveryExitMaxBinDrop: u.recoveryExitMaxBinDrop ?? 2,
   },
 
   // ─── Strategy Mapping ───────────────────

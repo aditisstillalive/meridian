@@ -409,6 +409,8 @@ const toolMap = {
       recoveryExitEnabled: ["management", "recoveryExitEnabled"],
       recoveryExitTriggerPct: ["management", "recoveryExitTriggerPct"],
       recoveryExitMinDD: ["management", "recoveryExitMinDD"],
+      recoveryExitConfirmTicks: ["management", "recoveryExitConfirmTicks"],
+      recoveryExitMaxBinDrop: ["management", "recoveryExitMaxBinDrop"],
       // pnl poller
       pnlConfirmTicks: ["pnl", "confirmTicks"],
       // opportunity poller (interval/enabled changes apply on next restart)
