@@ -1829,6 +1829,7 @@ async function closePositionInner({ position_address, reason }) {
         let finalValueUsd = 0;
         let initialUsd = 0;
         let feesUsd = tracked.total_fees_claimed_usd || 0;
+        let positionFoundInClosedApi = false;
         try {
           const closedUrl = `https://dlmm.datapi.meteora.ag/positions/${poolAddress}/pnl?user=${wallet.publicKey.toString()}&status=closed&pageSize=50&page=1`;
           for (let attempt = 0; attempt < 6; attempt++) {
@@ -1837,6 +1838,7 @@ async function closePositionInner({ position_address, reason }) {
               const data = await res.json();
               const posEntry = (data.positions || []).find((entry) => entry.positionAddress === position_address);
               if (posEntry) {
+                positionFoundInClosedApi = true;
                 pnlTrueUsd = safeNum(posEntry.pnlUsd);
                 pnlUsd = config.management.solMode ? getClosedPnlValue(posEntry, true) : pnlTrueUsd;
                 pnlPct = getClosedPnlPct(posEntry, config.management.solMode);
@@ -1907,6 +1909,7 @@ async function closePositionInner({ position_address, reason }) {
           entry_holders: tracked.entry_holders ?? null,
           max_pnl_pct,
           max_drawdown_pct,
+          ...(positionFoundInClosedApi ? { api_pnl_pct: pnlPct, api_pnl_usd: pnlTrueUsd } : {}),
           ...exitMarket,
         });
 
@@ -2255,6 +2258,7 @@ async function closePositionInner({ position_address, reason }) {
       let initialUsd = 0;
       let feesUsd = tracked.total_fees_claimed_usd || 0;
       let positionFoundInClosedApi = false;
+      let apiPnlAccepted = false;
       try {
         const closedUrl = `https://dlmm.datapi.meteora.ag/positions/${poolAddress}/pnl?user=${wallet.publicKey.toString()}&status=closed&pageSize=50&page=1`;
         for (let attempt = 0; attempt < 6; attempt++) {
@@ -2280,6 +2284,7 @@ async function closePositionInner({ position_address, reason }) {
                 finalValueUsd = nextFinalValueUsd;
                 initialUsd    = nextInitialUsd;
                 feesUsd       = nextFeesUsd;
+                apiPnlAccepted = true;
                 log("close", `Closed PnL from API: pnl=${pnlUsd.toFixed(2)} ${config.management.solMode ? "SOL" : "USD"} (${pnlPct.toFixed(2)}%), withdrawn=${finalValueUsd.toFixed(2)} USD, deposited=${initialUsd.toFixed(2)} USD`);
                 break;
               }
@@ -2367,6 +2372,7 @@ async function closePositionInner({ position_address, reason }) {
         entry_holders: tracked.entry_holders ?? null,
         max_pnl_pct,
         max_drawdown_pct,
+        ...(apiPnlAccepted ? { api_pnl_pct: pnlPct, api_pnl_usd: pnlTrueUsd } : {}),
         ...exitMarket,
       });
 

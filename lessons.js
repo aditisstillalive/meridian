@@ -113,10 +113,16 @@ export async function recordPerformance(perf) {
     return;
   }
 
-  const pnl_usd = (perf.final_value_usd + perf.fees_earned_usd) - perf.initial_value_usd;
-  const pnl_pct = perf.initial_value_usd > 0
-    ? (pnl_usd / perf.initial_value_usd) * 100
-    : 0;
+  // Meteora closed-PnL API is the source of truth; USD reconstruction is only a fallback
+  const hasApiPnl = Number.isFinite(perf.api_pnl_pct);
+  const pnl_usd = hasApiPnl && Number.isFinite(perf.api_pnl_usd)
+    ? perf.api_pnl_usd
+    : (perf.final_value_usd + perf.fees_earned_usd) - perf.initial_value_usd;
+  const pnl_pct = hasApiPnl
+    ? perf.api_pnl_pct
+    : perf.initial_value_usd > 0
+      ? (pnl_usd / perf.initial_value_usd) * 100
+      : 0;
   const range_efficiency = perf.minutes_held > 0
     ? (perf.minutes_in_range / perf.minutes_held) * 100
     : 0;
