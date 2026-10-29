@@ -354,7 +354,7 @@ export function getStateSummary() {
 
 /**
  * Check all exit conditions for a position (trailing TP, stop loss, OOR, low yield).
- * Updates peak_pnl_pct, trailing_active, and OOR state.
+ * Updates drawdown, trailing_active, and OOR state (peak is set by confirmPeak).
  * @param {string} position_address
  * @param {object} positionData - fields from getMyPositions: pnl_pct, in_range, fee_per_tvl_24h
  * @param {object} mgmtConfig
@@ -412,13 +412,12 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
 
   let changed = false;
 
-  // Track peak and drawdown
+  // Track drawdown. peak_pnl_pct is owned by confirmPeak() — raising it from a raw
+  // tick here let a single bad PnL tick arm trailing TP.
   if (currentPnlPct != null) {
-    const oldPeak = pos.peak_pnl_pct ?? 0;
     const oldMin = pos.min_pnl_pct ?? 0;
-    pos.peak_pnl_pct = Math.max(oldPeak, currentPnlPct);
     pos.min_pnl_pct = Math.min(oldMin, currentPnlPct);
-    pos.max_drawdown_pct = Math.max(0, pos.peak_pnl_pct - pos.min_pnl_pct);
+    pos.max_drawdown_pct = Math.max(0, (pos.peak_pnl_pct ?? 0) - pos.min_pnl_pct);
     changed = true;
   }
 
