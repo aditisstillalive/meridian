@@ -392,6 +392,7 @@ const toolMap = {
       autoSwapSettleDelayMs: ["management", "autoSwapSettleDelayMs"],
       outOfRangeBinsToClose: ["management", "outOfRangeBinsToClose"],
       outOfRangeWaitMinutes: ["management", "outOfRangeWaitMinutes"],
+      outOfRangeUpWaitMinutes: ["management", "outOfRangeUpWaitMinutes"],
       oorProfitHoldMinPct: ["management", "oorProfitHoldMinPct"],
       oorCooldownTriggerCount: ["management", "oorCooldownTriggerCount"],
       oorCooldownHours: ["management", "oorCooldownHours"],

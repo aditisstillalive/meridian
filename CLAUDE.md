@@ -188,7 +188,7 @@ The management cycle is **mostly deterministic in JS, LLM only for the hard case
 3. JS `updatePnlAndCheckExits(position, …)` for each:
    - `STOP_LOSS` if `pnl_pct <= stopLossPct`
    - `TRAILING_TP` if `trailing_active && (peak - current) >= trailingDropPct` (queued for 15s recheck)
-   - `OUT_OF_RANGE` if `minutes_out_of_range >= outOfRangeWaitMinutes`
+   - `OUT_OF_RANGE` if `minutes_out_of_range >= getOorWaitMinutes(...)` — `outOfRangeUpWaitMinutes` when the active bin is above the range (position all SOL), else `outOfRangeWaitMinutes`
    - `LOW_YIELD` if `fee_per_tvl_24h < minFeePerTvl24h && age >= minAgeBeforeYieldCheck`
 4. For positions with no exit alert: `getDeterministicCloseRule(p, mgmtConfig)` applies the **5 hard rules** (`index.js:895`):
    - Rule 1: stop loss, Rule 2: take profit, Rule 3: pumped far above range, Rule 4: OOR wait, Rule 5: low yield.

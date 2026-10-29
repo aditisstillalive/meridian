@@ -360,6 +360,19 @@ export function getStateSummary() {
  * @param {object} mgmtConfig
  * Returns { action, reason } or null if no exit needed.
  */
+/**
+ * OOR wait for a position, by direction. Above range the position is all SOL (no price risk,
+ * no fees), so it may get a separate, longer wait (outOfRangeUpWaitMinutes).
+ */
+export function getOorWaitMinutes(mgmtConfig, positionData) {
+  const above = positionData?.active_bin != null && positionData?.upper_bin != null &&
+    positionData.active_bin > positionData.upper_bin;
+  const upWait = Number(mgmtConfig.outOfRangeUpWaitMinutes);
+  return above && mgmtConfig.outOfRangeUpWaitMinutes != null && Number.isFinite(upWait) && upWait > 0
+    ? upWait
+    : mgmtConfig.outOfRangeWaitMinutes;
+}
+
 export function updatePnlAndCheckExits(position_address, positionData, mgmtConfig) {
   const { pnl_pct: currentPnlPct, pnl_pct_suspicious, in_range, fee_per_tvl_24h } = positionData;
   const state = load();
@@ -425,12 +438,13 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   let oorExit = null;
   if (pos.out_of_range_since) {
     const minutesOOR = Math.floor((Date.now() - new Date(pos.out_of_range_since).getTime()) / 60000);
-    if (minutesOOR >= mgmtConfig.outOfRangeWaitMinutes) {
+    const oorWait = getOorWaitMinutes(mgmtConfig, positionData);
+    if (minutesOOR >= oorWait) {
       const holdThresh = mgmtConfig.oorProfitHoldMinPct ?? 0;
       if (!(holdThresh > 0 && currentPnlPct != null && currentPnlPct >= holdThresh)) {
         oorExit = {
           action: "OUT_OF_RANGE",
-          reason: `Out of range for ${minutesOOR}m (limit: ${mgmtConfig.outOfRangeWaitMinutes}m)`,
+          reason: `Out of range for ${minutesOOR}m (limit: ${oorWait}m)`,
         };
       }
     }
