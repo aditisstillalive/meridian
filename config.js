@@ -156,6 +156,8 @@ export const config = {
     recoveryExitConfirmTicks: u.recoveryExitConfirmTicks ?? 4,
     // Cancel a recovery exit if the on-chain active bin is this many bins below the triggering tick
     recoveryExitMaxBinDrop: u.recoveryExitMaxBinDrop ?? 2,
+    // Close any position held this long (minutes); 0/null disables
+    maxHoldMinutes: u.maxHoldMinutes ?? 0,
   },
 
   // ─── Strategy Mapping ───────────────────

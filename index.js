@@ -1045,6 +1045,15 @@ function getDeterministicCloseRule(position, managementConfig) {
       reason: `recovery exit: DD ${tracked.max_drawdown_pct.toFixed(1)}% >= ${managementConfig.recoveryExitMinDD}%, PnL ${position.pnl_pct.toFixed(2)}% >= ${managementConfig.recoveryExitTriggerPct}%`,
     };
   }
+  // Rule 7: Max hold — fees are front-loaded while price exposure keeps costing; exit after N minutes
+  const maxHold = Number(managementConfig.maxHoldMinutes) || 0;
+  if (maxHold > 0) {
+    const ageMin = position.age_minutes ??
+      (tracked?.deployed_at ? Math.floor((Date.now() - new Date(tracked.deployed_at).getTime()) / 60000) : null);
+    if (ageMin != null && ageMin >= maxHold) {
+      return { action: "CLOSE", rule: 7, reason: `max hold: ${ageMin}m >= ${maxHold}m` };
+    }
+  }
   return null;
 }
 

@@ -49,6 +49,7 @@
   "notifSuppress": false,
   "outOfRangeBinsToClose": 10,
   "outOfRangeWaitMinutes": 30,
+  "maxHoldMinutes": 0,
   "oorCooldownTriggerCount": 3,
   "oorCooldownHours": 12,
   "minVolumeToRebalance": 1000,
