@@ -457,7 +457,8 @@ async function poll(onMessage) {
       }
     } catch (e) {
       if (!e.message?.includes("aborted")) {
-        log("telegram_error", `Poll error: ${e.message}`);
+        const cause = e.cause?.code || e.cause?.message;
+        log("telegram_error", `Poll error: ${e.message}${cause ? ` (${cause})` : ""}`);
       }
       await sleep(5000);
     }
@@ -547,13 +548,16 @@ export async function notifyClose({ pair, pnlUsd, pnlPct, reason }) {
     log("telegram", `notifyClose suppressed: liveMessageDepth=${_liveMessageDepth}, notifDuringLiveMessage=${config.management?.notifDuringLiveMessage}`);
     return;
   }
-  const sign = pnlUsd >= 0 ? "+" : "";
   const pnl = pnlUsd ?? 0;
+  const pct = pnlPct ?? 0;
   const icon = pnl > 0 ? "🟢" : pnl < 0 ? "🔴" : "🔒";
+  // In solMode the close result's pnl_usd field carries a SOL value
+  const solMode = Boolean(config.management?.solMode);
+  const amount = `${pnl < 0 ? "-" : "+"}${solMode ? "◎" : "$"}${Math.abs(pnl).toFixed(solMode ? 4 : 2)}`;
   await sendHTML(
     `${icon} <b>Closed</b> ${escapeHtml(pair)}\n` +
     `${escapeHtml(reason)}\n` +
-    `PnL: ${sign}$${pnl.toFixed(2)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)`
+    `PnL: ${amount} (${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%)`
   );
 }
 
