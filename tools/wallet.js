@@ -302,8 +302,10 @@ export async function getOnchainTokenBalance(mint) {
     const ui = decimals === 0 ? totalRaw.toString() : (Number(totalRaw / 10n ** BigInt(decimals))).toFixed(decimals).replace(/\.?0+$/, "");
     return { raw: totalRaw, decimals, ui };
   } catch (e) {
+    // Throw instead of reporting 0: callers diff balances, and a fake 0 either
+    // hides a withdrawal or makes existing tokens look like a fresh one.
     log("wallet_error", `getOnchainTokenBalance ${mint}: ${e.message}`);
-    return { raw: 0n, decimals: 0, ui: "0" };
+    throw e;
   }
 }
 
@@ -365,11 +367,16 @@ export async function swapToken({
 
     // ─── Convert to smallest unit ──────────────────────────────
     let decimals = 9; // SOL default
-    if (input_mint !== config.SOL) {
+    if (input_mint !== config.tokens.SOL) {
       const mintInfo = await connection.getParsedAccountInfo(new PublicKey(input_mint));
-      decimals = mintInfo.value?.data?.parsed?.info?.decimals ?? 9;
+      decimals = mintInfo.value?.data?.parsed?.info?.decimals;
+      // A guessed 9 on a 6-decimal token asks Jupiter for 1000x the amount.
+      if (!Number.isInteger(decimals)) throw new Error(`Could not read decimals for ${input_mint}`);
     }
-    const amountStr = Math.floor(amount * Math.pow(10, decimals)).toString();
+    // Exact string → raw conversion; float math can round past the real balance.
+    const amountStr = typeof amount === "string" && /^\d+(\.\d+)?$/.test(amount.trim())
+      ? uiToRawAmount(amount, decimals).toString()
+      : Math.floor(Number(amount) * Math.pow(10, decimals)).toString();
 
     // ─── Get Swap V2 order (unsigned tx + requestId) ───────────
     const search = new URLSearchParams({
