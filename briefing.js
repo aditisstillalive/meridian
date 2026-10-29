@@ -3,6 +3,8 @@ import { log } from "./logger.js";
 import { getPerformanceSummary } from "./lessons.js";
 import { repoPath } from "./repo-root.js";
 import { escapeHtml } from "./telegram.js";
+import { config } from "./config.js";
+import { getWallet } from "./tools/wallet.js";
 
 const STATE_FILE = repoPath("state.json");
 const LESSONS_FILE = repoPath("lessons.json");
@@ -30,6 +32,18 @@ export async function generateBriefing() {
   // 4. Current State
   const openPositions = allPositions.filter(p => !p.closed);
   const perfSummary = getPerformanceSummary();
+  const meteoraTotal = await fetchMeteoraAllTimePnl();
+  const solMode = Boolean(config.management.solMode);
+
+  let allTimeLine = "";
+  if (meteoraTotal) {
+    const value = solMode ? meteoraTotal.pnlSol : meteoraTotal.pnlUsd;
+    const winPart = perfSummary ? `, ${perfSummary.win_rate_pct}% win since ${perfSince(lessonsData)}` : "";
+    allTimeLine = `📊 All-time PnL: ${formatSigned(value, solMode ? "◎" : "$", solMode ? 4 : 2)} (${meteoraTotal.closed} closed${winPart})`;
+  } else if (perfSummary) {
+    // Meteora unreachable — local log only covers positions since it started
+    allTimeLine = `📊 PnL since ${perfSince(lessonsData)}: $${perfSummary.total_pnl_usd.toFixed(2)} (${perfSummary.win_rate_pct}% win, local log)`;
+  }
 
   // 5. Format Message
   const lines = [
@@ -53,13 +67,41 @@ export async function generateBriefing() {
     "",
     `<b>Current Portfolio:</b>`,
     `📂 Open Positions: ${openPositions.length}`,
-    perfSummary
-      ? `📊 All-time PnL: $${perfSummary.total_pnl_usd.toFixed(2)} (${perfSummary.win_rate_pct}% win)`
-      : "",
+    allTimeLine,
     "────────────────"
   ];
 
   return lines.join("\n");
+}
+
+// Wallet-wide all-time PnL as shown on the Meteora dashboard (local lessons.json
+// only covers closes recorded since the performance log started).
+async function fetchMeteoraAllTimePnl() {
+  try {
+    const user = getWallet().publicKey.toString();
+    const res = await fetch(`https://dlmm.datapi.meteora.ag/portfolio/total?user=${user}`, {
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const pnlUsd = Number(data.totalPnlUsd);
+    const pnlSol = Number(data.totalPnlSol);
+    if (!Number.isFinite(pnlUsd)) throw new Error("missing totalPnlUsd");
+    return { pnlUsd, pnlSol, closed: data.totalClosedPositions ?? "?" };
+  } catch (err) {
+    log("briefing_warn", `Meteora all-time PnL fetch failed: ${err.message}`);
+    return null;
+  }
+}
+
+function perfSince(lessonsData) {
+  const first = (lessonsData.performance || []).map(p => p.recorded_at).filter(Boolean).sort()[0];
+  return first ? first.slice(0, 10) : "?";
+}
+
+function formatSigned(value, unit, digits) {
+  if (!Number.isFinite(value)) return "?";
+  return `${value >= 0 ? "+" : "-"}${unit}${Math.abs(value).toFixed(digits)}`;
 }
 
 function loadJson(file) {
