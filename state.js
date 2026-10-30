@@ -383,15 +383,18 @@ export function isOorProfitHold(mgmtConfig, pnlPct) {
 /**
  * Why a position past maxHoldMinutes may keep running (null = close it).
  * Extends while profitable OR still healthy (in range, earning fees, PnL above floor),
- * up to maxHoldMinutes × maxHoldExtendMaxMult.
+ * up to maxHoldMinutes × maxHoldExtendMaxMult. An extended position is trailed like
+ * trailing TP: it closes once PnL gives back trailingDropPct from its confirmed peak.
  */
-export function getMaxHoldExtension(mgmtConfig, positionData, ageMin, pnlSuspect = false) {
+export function getMaxHoldExtension(mgmtConfig, positionData, ageMin, pnlSuspect = false, peakPnlPct = null) {
   if (!mgmtConfig.maxHoldExtendEnabled) return null;
   const maxHold = Number(mgmtConfig.maxHoldMinutes) || 0;
   const mult = Number(mgmtConfig.maxHoldExtendMaxMult) || 1;
   if (maxHold <= 0 || ageMin >= maxHold * mult) return null;
   const pnl = pnlSuspect ? null : positionData.pnl_pct;
   if (pnl == null) return null;
+  const giveBack = Number(mgmtConfig.trailingDropPct);
+  if (peakPnlPct != null && giveBack > 0 && pnl < peakPnlPct - giveBack) return null;
   if (pnl >= mgmtConfig.maxHoldExtendMinPnlPct) return `profit ${pnl.toFixed(2)}%`;
   const fee = positionData.fee_per_tvl_24h;
   if (

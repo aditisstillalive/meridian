@@ -1066,7 +1066,7 @@ function getDeterministicCloseRule(position, managementConfig) {
     const ageMin = position.age_minutes ??
       (tracked?.deployed_at ? Math.floor((Date.now() - new Date(tracked.deployed_at).getTime()) / 60000) : null);
     if (ageMin != null && ageMin >= maxHold) {
-      const extension = getMaxHoldExtension(managementConfig, position, ageMin, pnlSuspect);
+      const extension = getMaxHoldExtension(managementConfig, position, ageMin, pnlSuspect, tracked?.peak_pnl_pct ?? null);
       if (extension) {
         if (!_maxHoldExtendLogged.has(position.position)) {
           _maxHoldExtendLogged.add(position.position);
@@ -1074,7 +1074,12 @@ function getDeterministicCloseRule(position, managementConfig) {
         }
         return null;
       }
-      return { action: "CLOSE", rule: 7, reason: `max hold: ${ageMin}m >= ${maxHold}m` };
+      const peak = tracked?.peak_pnl_pct;
+      const gaveBack = peak != null && position.pnl_pct != null ? peak - position.pnl_pct : null;
+      const trailNote = gaveBack != null && gaveBack > Number(managementConfig.trailingDropPct)
+        ? ` (gave back ${gaveBack.toFixed(2)}% from peak ${peak.toFixed(2)}%)`
+        : "";
+      return { action: "CLOSE", rule: 7, reason: `max hold: ${ageMin}m >= ${maxHold}m${trailNote}` };
     }
   }
   return null;
