@@ -103,9 +103,15 @@ export function isEnabled() {
 const NON_IDEMPOTENT = new Set(["sendMessage", "sendPhoto", "sendDocument"]);
 const NOT_SENT_CODES = new Set(["UND_ERR_CONNECT_TIMEOUT", "ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH"]);
 
-function canRetryNetworkError(method, e) {
+// A reset within this long after starting is a stale keep-alive socket: the request never got
+// to Telegram, so it is safe to resend. A later reset may have hit after delivery.
+const STALE_SOCKET_CODES = new Set(["ECONNRESET", "UND_ERR_SOCKET", "EPIPE"]);
+const STALE_SOCKET_MS = 2000;
+
+function canRetryNetworkError(method, e, elapsedMs) {
   const code = e?.cause?.code ?? e?.code;
   if (NOT_SENT_CODES.has(code)) return true;
+  if (STALE_SOCKET_CODES.has(code) && elapsedMs < STALE_SOCKET_MS) return true;
   if (NON_IDEMPOTENT.has(method)) return false;
   return e.name === "AbortError" || e.message.includes("fetch failed") || e.message.includes("ETIMEDOUT");
 }
@@ -114,6 +120,7 @@ async function postTelegram(method, body, attempt = 1) {
   if (!TOKEN || !chatId) return null;
   const maxRetries = 3;
   const baseDelay = 1000;
+  const startedAt = Date.now();
   
   try {
     const controller = new AbortController();
@@ -154,13 +161,14 @@ async function postTelegram(method, body, attempt = 1) {
     return json;
   } catch (e) {
     const code = e?.cause?.code ?? e?.code ?? e.name;
-    if (attempt < maxRetries && canRetryNetworkError(method, e)) {
+    const elapsedMs = Date.now() - startedAt;
+    if (attempt < maxRetries && canRetryNetworkError(method, e, elapsedMs)) {
       const delay = baseDelay * Math.pow(2, attempt - 1);
-      log("telegram_warn", `${method} network error: ${e.message} (${code}) — retrying in ${delay}ms (attempt ${attempt}/${maxRetries})`);
+      log("telegram_warn", `${method} network error: ${e.message} (${code}, ${elapsedMs}ms) — retrying in ${delay}ms (attempt ${attempt}/${maxRetries})`);
       await new Promise(r => setTimeout(r, delay));
       return postTelegram(method, body, attempt + 1);
     }
-    const unsure = NON_IDEMPOTENT.has(method) && !NOT_SENT_CODES.has(code) ? " — not retried, it may still have been delivered" : "";
+    const unsure = NON_IDEMPOTENT.has(method) && !NOT_SENT_CODES.has(code) ? ` after ${elapsedMs}ms — not retried, it may still have been delivered` : "";
     log("telegram_error", `${method} failed: ${e.message} (${code})${unsure}`);
     return null;
   }
