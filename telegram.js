@@ -97,6 +97,19 @@ export function isEnabled() {
   return !!TOKEN;
 }
 
+// Sending a message is not idempotent: a request that timed out after reaching Telegram
+// was usually delivered, so retrying it posts the message again. Retry sends only when the
+// connection itself failed (nothing was sent); other methods (edits, commands) are safe to repeat.
+const NON_IDEMPOTENT = new Set(["sendMessage", "sendPhoto", "sendDocument"]);
+const NOT_SENT_CODES = new Set(["UND_ERR_CONNECT_TIMEOUT", "ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH"]);
+
+function canRetryNetworkError(method, e) {
+  const code = e?.cause?.code ?? e?.code;
+  if (NOT_SENT_CODES.has(code)) return true;
+  if (NON_IDEMPOTENT.has(method)) return false;
+  return e.name === "AbortError" || e.message.includes("fetch failed") || e.message.includes("ETIMEDOUT");
+}
+
 async function postTelegram(method, body, attempt = 1) {
   if (!TOKEN || !chatId) return null;
   const maxRetries = 3;
@@ -104,7 +117,9 @@ async function postTelegram(method, body, attempt = 1) {
   
   try {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 10000);
+    // Generous timeout: Telegram is sometimes slow to answer from this host, and an aborted
+    // send may still have been delivered (see canRetryNetworkError)
+    const timeoutId = setTimeout(() => controller.abort(), 30000);
     
     const res = await fetch(`${BASE}/${method}`, {
       method: "POST",
@@ -138,13 +153,15 @@ async function postTelegram(method, body, attempt = 1) {
     }
     return json;
   } catch (e) {
-    if (attempt < maxRetries && (e.name === 'AbortError' || e.message.includes('fetch failed') || e.message.includes('ENOTFOUND') || e.message.includes('ECONNREFUSED') || e.message.includes('ETIMEDOUT'))) {
+    const code = e?.cause?.code ?? e?.code ?? e.name;
+    if (attempt < maxRetries && canRetryNetworkError(method, e)) {
       const delay = baseDelay * Math.pow(2, attempt - 1);
-      log("telegram_warn", `${method} network error: ${e.message} — retrying in ${delay}ms (attempt ${attempt}/${maxRetries})`);
+      log("telegram_warn", `${method} network error: ${e.message} (${code}) — retrying in ${delay}ms (attempt ${attempt}/${maxRetries})`);
       await new Promise(r => setTimeout(r, delay));
       return postTelegram(method, body, attempt + 1);
     }
-    log("telegram_error", `${method} failed: ${e.message}`);
+    const unsure = NON_IDEMPOTENT.has(method) && !NOT_SENT_CODES.has(code) ? " — not retried, it may still have been delivered" : "";
+    log("telegram_error", `${method} failed: ${e.message} (${code})${unsure}`);
     return null;
   }
 }
